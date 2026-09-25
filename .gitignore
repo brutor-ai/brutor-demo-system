@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# Secrets and generated credentials: never commit.
+#   .env       your settings, including OPENAI_API_KEY and the admin password
+#   .demo.env  written by setup.py: the demo's Brutor API keys and resource ids
+# Only the template, .env.example, is tracked.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.demo.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime data written by the MCP servers and agents when run outside Docker
+data/
+*.sqlite
+*.db
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

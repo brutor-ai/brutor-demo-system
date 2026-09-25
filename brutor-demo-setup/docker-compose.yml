@@ -1,0 +1,114 @@
+# Brutor Demo System: the four demo containers (DESIGN.md section 5.6).
+#
+# All services join the trial bundle's external network `brutor-network` and
+# address the gateway as http://core:8100. The gateway addresses them by
+# container name. Host publishing is loopback only.
+#
+# `.demo.env` is written by setup.py (API keys, server ids, model names).
+# The screening agent is behind the `agent` profile so `demo.sh up` can start
+# the MCP servers and the fraud agent first, provision, and only then start it.
+
+name: brutor-demo-system
+
+services:
+  applications-mcp:
+    build: ../brutor-demo-applications-mcp
+    image: brutor-demo-applications-mcp:local
+    container_name: brutor-demo-applications-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3014:3014"
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "3014"
+      DATA_DIR: /data
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      GENERATE_INTERVAL_SECONDS: "${GENERATE_INTERVAL_SECONDS:-600}"
+      GENERATE_MIN_PER_INTERVAL: "${GENERATE_MIN_PER_INTERVAL:-2}"
+      GENERATE_MAX_PER_INTERVAL: "${GENERATE_MAX_PER_INTERVAL:-3}"
+      GENERATOR_SEED: "${GENERATOR_SEED:-20260923}"
+    volumes:
+      - brutor-demo-applications-data:/data
+    networks:
+      - brutor-network
+
+  credit-bureau-mcp:
+    build: ../brutor-demo-credit-bureau-mcp
+    image: brutor-demo-credit-bureau-mcp:local
+    container_name: brutor-demo-credit-bureau-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3015:3015"
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "3015"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    networks:
+      - brutor-network
+
+  fraud-screener-agent:
+    build: ../brutor-demo-fraud-screener-agent
+    image: brutor-demo-fraud-screener-agent:local
+    container_name: brutor-demo-fraud-screener-agent
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9200:9200"
+    env_file:
+      - path: .demo.env
+        required: false
+    environment:
+      A2A_PORT: "9200"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # The key comes from .demo.env (FRAUD_BRUTOR_API_KEY, read by the agent
+      # in preference to BRUTOR_API_KEY), never from shell interpolation: a
+      # `docker compose up` run outside demo.sh would otherwise blank it.
+      BRUTOR_GATEWAY_URL: http://core:8100
+      BRUTOR_TENANT_ID: "${BRUTOR_TENANT_ID:-default}"
+      A2A_PUBLIC_URL: http://brutor-demo-fraud-screener-agent:9200
+      CLASSIFIER_MODEL: "${CLASSIFIER_MODEL:-gpt-5.2}"
+    networks:
+      - brutor-network
+
+  screening-agent:
+    build: ../brutor-demo-screening-agent
+    image: brutor-demo-screening-agent:local
+    container_name: brutor-demo-screening-agent
+    restart: unless-stopped
+    profiles:
+      - agent
+    ports:
+      - "127.0.0.1:9201:9201"
+    # demo.sh start refuses to run with an empty .demo.env; here it is optional
+    # so `docker compose config` and `demo.sh status` work before provisioning.
+    env_file:
+      - path: .demo.env
+        required: false
+    environment:
+      BRUTOR_GATEWAY_URL: http://core:8100
+      DATA_DIR: /data
+      # Re-raises of a lapsed underwriter hold (0 = unlimited). Each re-raise is
+      # an escalated one-action run, so keep this small on cores older than
+      # 0.10.95, where band holds always expire after 300 s.
+      RERAISE_MAX: "${RERAISE_MAX:-0}"
+      HEALTH_PORT: "9201"
+      TICK_SECONDS: "${TICK_SECONDS:-600}"
+      MAX_PER_TICK: "${MAX_PER_TICK:-5}"
+      CLASSIFIER_API: "${CLASSIFIER_API:-chat}"
+      DRAFTER_API: "${DRAFTER_API:-responses}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      - brutor-demo-agent-data:/data
+    depends_on:
+      - applications-mcp
+      - credit-bureau-mcp
+      - fraud-screener-agent
+    networks:
+      - brutor-network
+
+volumes:
+  brutor-demo-applications-data:
+  brutor-demo-agent-data:
+
+networks:
+  brutor-network:
+    external: true

@@ -1,0 +1,127 @@
+# CI for the Brutor Demo System.
+#
+# Everything here runs without a Brutor gateway or an OpenAI key: the unit
+# tests are in-process, the setup script has a --dry-run, and the images are
+# built but never pushed. The demo is a source-built add-on to a local Brutor
+# trial (see README "Release status"), so there is nothing to publish.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets-guard:
+    name: No secrets tracked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse committed env files and API keys
+        run: |
+          set -e
+          tracked=$(git ls-files | grep -E '(^|/)\.demo\.env$|(^|/)\.env$|(^|/)\.env\.[^/]*$' | grep -v '\.env\.example$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::Environment files must not be committed:"; echo "$tracked"; exit 1
+          fi
+          # OpenAI / Anthropic / Brutor key shapes in tracked files. Docs and the
+          # tests' deliberately fake fixture keys are excluded.
+          hits=$(git grep -nE 'sk-(proj-|ant-)?[A-Za-z0-9_-]{20,}|sk_brutor_api_[A-Za-z0-9]{16,}' -- ':!*.md' ':!**/tests/**' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Something that looks like a real API key is committed:"; echo "$hits"; exit 1
+          fi
+          echo "No env files or API keys tracked."
+
+  tests:
+    name: Tests · ${{ matrix.component }} · py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        component:
+          - brutor-demo-applications-mcp
+          - brutor-demo-credit-bureau-mcp
+          - brutor-demo-fraud-screener-agent
+          - brutor-demo-screening-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: ${{ matrix.component }}/pyproject.toml
+      - name: Install
+        run: python -m pip install "./${{ matrix.component }}[test]"
+      - name: Test
+        working-directory: ${{ matrix.component }}
+        run: python -m pytest -q
+
+  skill:
+    name: Tests · affordability skill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - name: Test
+        working-directory: brutor-demo-affordability-skill
+        run: python -m pytest -q
+
+  setup:
+    name: Setup scripts and compose
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: brutor-demo-setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python compiles
+        run: python -m py_compile setup.py verify.py
+      - name: Provisioning plan (dry run, no gateway needed)
+        run: python setup.py --dry-run
+      - name: Shell scripts
+        run: |
+          bash -n demo.sh
+          shellcheck -S error demo.sh ../*/smoke.sh
+      - name: Compose file resolves
+        run: |
+          cp .env.example .env
+          touch .demo.env
+          docker compose -f docker-compose.yml --profile agent config --quiet
+
+  images:
+    name: Image · ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - brutor-demo-applications-mcp
+          - brutor-demo-credit-bureau-mcp
+          - brutor-demo-fraud-screener-agent
+          - brutor-demo-screening-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.component }}
+          push: false
+          tags: ${{ matrix.component }}:ci
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
