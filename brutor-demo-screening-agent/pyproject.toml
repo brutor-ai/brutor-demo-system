@@ -7,7 +7,7 @@ name = "brutor-demo-screening-agent"
 version = "0.1.0"
 description = "Brutor Demo System: LangGraph loan pre-screening agent that runs every governed action through the Brutor gateway."
 requires-python = ">=3.12"
-license = {text = "Proprietary"}
+license = { text = "Apache-2.0" }
 dependencies = [
     "langgraph>=0.2,<2",
     "openai>=1.40,<3",

@@ -253,3 +253,10 @@ on 2026-09-23.
   warns when it is absent.
 - The screening agent has no loop, so a run never ends `exhausted`; the demo
   says so rather than faking it.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). You may copy, change
+and build on the demo, including commercially. The Brutor name and logo are trademarks
+of Brutor AI Ltd. and are not covered by the licence. The Brutor platform the demo
+runs against is licensed separately.

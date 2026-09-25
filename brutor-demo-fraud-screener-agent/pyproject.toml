@@ -7,7 +7,7 @@ name = "brutor-demo-fraud-screener-agent"
 version = "0.1.0"
 description = "Brutor Demo System: mock Fraud and Sanctions Screener, an A2A remote agent that echoes the gateway's delegation chain on its own model call."
 requires-python = ">=3.12"
-license = {text = "Proprietary"}
+license = { text = "Apache-2.0" }
 dependencies = [
     "starlette>=0.37,<2",
     "uvicorn>=0.30,<1",
