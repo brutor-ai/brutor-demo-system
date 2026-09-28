@@ -16,6 +16,15 @@ Header contract (every call inside a run):
     X-Brutor-Step-Name   human label for the step
     traceparent          00-<trace id per run>-<span id per call>-01
 
+Agent release headers (RFC 0023, identity.py), on EVERY call, in a run or not:
+
+    X-Brutor-Agent-Name     brutor-demo-screening-agent
+    X-Brutor-Agent-Version  installed distribution version (pyproject.toml)
+    X-Brutor-Agent-Build    BRUTOR_AGENT_BUILD, only when set
+
+MCP calls (tools, skills) also carry params._meta["io.modelcontextprotocol/clientInfo"]
+= {name, version}, the standard MCP carrier the gateway ranks above the headers.
+
 Closing headers, only on the last call of the run:
 
     X-Brutor-Run-End     a literal terminal state, never "true"
@@ -49,6 +58,7 @@ from typing import Any, Iterator
 import httpx
 
 from .config import Settings
+from .identity import MCP_CLIENT_INFO_META_KEY, AgentRelease, current_release
 
 log = logging.getLogger("screening_agent.gateway")
 
@@ -182,11 +192,14 @@ class Gateway:
     """Synchronous client for the Brutor Core Proxy.
 
     `http` may be injected (tests use an httpx.MockTransport); the OpenAI SDK
-    client shares it so the LLM path is exercised the same way.
+    client shares it so the LLM path is exercised the same way. `release` is
+    the agent's implementation identity (RFC 0023); by default the installed
+    distribution's name and version plus settings.agent_build.
     """
 
-    def __init__(self, settings: Settings, http: httpx.Client | None = None):
+    def __init__(self, settings: Settings, http: httpx.Client | None = None, release: AgentRelease | None = None):
         self.settings = settings
+        self.release = release or current_release(settings.agent_build)
         self.base = settings.gateway_url.rstrip("/")
         self.http = http or httpx.Client(timeout=settings.http_timeout_seconds)
         self.ctx: RunContext | None = None
@@ -222,10 +235,12 @@ class Gateway:
         approval_token: str | None = None,
     ) -> dict[str, str]:
         """Build the per-call header set. Outside a run (ctx is None) only the
-        auth headers are produced (approval polls are not proxied actions)."""
+        auth and agent release headers are produced (approval polls are not
+        proxied actions). The release headers are on every call (RFC 0023)."""
         h = {
             "Authorization": f"Bearer {self.settings.api_key}",
             "X-Tenant-ID": self.settings.tenant_id,
+            **self.release.headers(),
         }
         ctx = self.ctx
         if ctx is not None:
@@ -543,7 +558,15 @@ class Gateway:
             "jsonrpc": "2.0",
             "id": self._rpc_id,
             "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
+            "params": {
+                "name": tool,
+                "arguments": arguments,
+                # MCP 2026-07-28 per-request client identity; the agent sends no
+                # initialize (the servers are stateless, and a handshake would
+                # be an extra governed action in every run), so this is the
+                # only clientInfo the gateway sees.
+                "_meta": {MCP_CLIENT_INFO_META_KEY: self.release.client_info()},
+            },
         }
         started = time.monotonic()
         try:

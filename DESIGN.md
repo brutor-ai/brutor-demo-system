@@ -246,12 +246,43 @@ through the API.
 
 A2A remote agent, its own AI System (`brutor-demo-fraud-screener`, kind agent, EU AI
 Act tier **minimal**: fraud detection is explicitly carved out of Annex III 5(b)). Port
-9200. Serves:
+9200. It is declared as a **critical shared service** of the Brutor Demo System that
+contributes to the decision (RFC 0022), so its **effective** tier is **high** via the
+Demo System: the Art 6(3) carve-out is shown as a claim a reviewer can see and
+challenge, not applied silently. The compliance registry evaluates the screener **at
+its effective tier** (RFC 0022 Phase 3): the high-risk EU AI Act obligations apply to
+it, and the Demo System's "Classification of a composite system" statement (Art 6)
+is met because its one contributing dependency is itself assessed at high. The
+screener is built and run by Borealis, the same legal entity as the Demo System, so
+the edge names no `supplier_legal_entity` and no Art 25(4) supplier agreement is
+required.
+
+It roots no runs of its own: every call it serves happens inside a Demo System run.
+It is therefore assured **as a service**, from its run segments (RFC 0022 §7.2): its
+health reads `signal_basis: segments`; liveness is responsiveness when called
+(`on_demand`: alive while it answers, silent only when a call goes unanswered, idle
+when uncalled); behaviour and cost come from `basis='segments'` baselines (actions,
+model calls, tokens and cost per served call, tool and model mix, outcome mix, error
+rates), which reach `ready` after 50 served calls; reliability is the answered share of
+its calls; conformance compares the models its segments used with its grants and its
+callers with `intended_client_systems`; oversight is **not applicable** (it raises no
+holds), never 0 %. It never reads "silent" or "not measured" while it answers.
+
+Its health flows to the Demo System. Because the edge is **critical**, the Demo
+System's health is capped at **degraded** (reason `dependency`, naming the screener
+and its failing signal) whenever the screener is not healthy — the demo system cannot
+be healthier than a dependency it cannot decide without. The health and assurance
+responses carry this as `dependency_health` (basis `tested`) and `dependency_cap`, and
+the root gets an open `dependency` finding that the response policy can act on
+(section 7.3). Serves:
 
 - `GET /health`
 - `GET /.well-known/agent-card.json` (A2A 1.0 card, `supportedInterfaces` JSONRPC 1.0
   at `http://brutor-demo-fraud-screener-agent:9200`, one skill with
-  `id` = `name` = `screening.fraud_sanctions`, `data_classification: ["PII"]`)
+  `id` = `name` = `screening.fraud_sanctions`, `data_classification: ["PII"]`; its
+  `version` is the screener's release version from `identity.py`, i.e. the installed
+  distribution's, so the card, `X-Brutor-Agent-Version` and the identity's
+  `approved_versions` always name the same release)
 - `POST /message:send` and `POST /message%3Asend` (both spellings; the gateway
   percent-encodes the colon). Reads `body["message"]`, falling back to
   `body["params"]["message"]`. No auth (the gateway sends none; network isolation is
@@ -273,10 +304,18 @@ model_used}`.
 
 Chain: it copies every inbound `x-brutor-delegation-*` header (root, parent, depth,
 sig, actor, subject) onto its LLM call, unchanged, and sends **no** `x-brutor-run-id`.
-It still sends `X-Brutor-Step-Id: fraud_llm` and a turn id. It authenticates with its
+It declares a turn of its own (`X-Brutor-Turn-Id: t01-fraud_llm-…`, seq 1) but **no**
+step: steps are the caller's phases. It authenticates with its
 own API key (bound to the fraud screener identity), so the action lands in the caller's
 run at depth 1 with `trace_continuity=verified` and the fraud system appears in
 `via_system_ids`.
+
+Release (RFC 0023): its model call also carries `X-Brutor-Agent-Name:
+brutor-demo-fraud-screener-agent`, `X-Brutor-Agent-Version: <its pyproject version>`
+and, when the image was built with one, `X-Brutor-Agent-Build` (section 8, "Agent
+release"). The caller's own `X-Brutor-Agent-*` headers are never copied, so the
+segment the gateway records for the screener carries the screener's release, not the
+screening agent's. `/health` reports the same name, version and build.
 
 ### 5.5 Screening agent (`brutor-demo-screening-agent`)
 
@@ -290,7 +329,8 @@ Package layout:
 screening_agent/
   __main__.py      CLI: run loop | --once | --health-port
   config.py        env vars (below)
-  gateway.py       one client: headers builder (run/turn/step/traceparent), llm(), mcp_call(), skill_run(), a2a_delegate(), end_run(), poll_approval()
+  gateway.py       one client: headers builder (run/turn/step/traceparent + agent release), llm(), mcp_call(), skill_run(), a2a_delegate(), end_run(), poll_approval()
+  identity.py      the agent's implementation identity (RFC 0023): name, installed version, build
   graph.py         LangGraph StateGraph with the eight nodes
   rules.py         deterministic decision rules (pure functions, unit-tested)
   approvals.py     pending approval store + resolution
@@ -306,7 +346,10 @@ Env (all read by `config.py`, provided by `.demo.env`):
 (default `system-agent-skill-server-default`), `FRAUD_CARD_ID`,
 `FRAUD_CAPABILITY` (default `screening.fraud_sanctions`), `CLASSIFIER_MODEL`
 (default `gpt-5.2`), `DRAFTER_MODEL` (default `gpt-5.5`), `TICK_SECONDS` (600),
-`MAX_PER_TICK` (5), `DATA_DIR` (`/data`), `HEALTH_PORT` (9201), `LOG_LEVEL`.
+`MAX_PER_TICK` (5), `DATA_DIR` (`/data`), `HEALTH_PORT` (9201), `LOG_LEVEL`,
+`BRUTOR_AGENT_BUILD` (empty; baked into the image from the Dockerfile's build arg of
+the same name, see section 8 "Agent release"). There is deliberately no variable for
+the agent's name or version: they come from the installed distribution.
 
 Rules (`rules.py`, applied after the drafter): identity unverified → `refer`;
 affordability `unaffordable` → `decline`; fraud `hit` → `decline`; fraud `review` →
@@ -321,7 +364,7 @@ top_p is sent on any LLM call (gpt-5.x and Claude 4.8+ reject them).
 
 ```
 setup.py         idempotent REST provisioning (section 6), writes .demo.env
-verify.py        reads back health, runs, contract, gate, obligations, evidence, Annex IV doc
+verify.py        reads back health, runs, contract, gate, obligations, evidence, Annex IV doc, and (RFC 0023) each identity's declared implementation, the empty client labels and the latest observed release with its trust
 docker-compose.yml  the four containers on the external brutor-network, env_file .demo.env, a named volume for the agent's /data and the applications' /data
 demo.sh          up | provision | start | status | logs | down | run-one | generate
                  (orchestrates the order below; run-one screens one application, generate adds N)
@@ -358,14 +401,19 @@ the first unrecoverable error and says which step. Control plane at `CP_URL`
 4. **AI Systems.** Two `ai_system` groups under it:
    - `brutor-demo-system`, display "Brutor Demo System", system_kind agent, owner
      "Anna Berg, Head of Credit Risk", intended_use (the paragraph from section 1),
-     intended_clients `["brutor-demo-screening-agent"]`, eu_ai_act_risk_tier `high`,
+     intended_client_labels `[]` (sent explicitly so a re-run converges an older
+     `["brutor-demo-screening-agent"]` away: the system's only caller is its own member
+     agent, which RFC 0023 judges on its implementation and release, never as a client
+     label; before RFC 0023 the label was compared with the raw `User-Agent`,
+     `python-httpx/0.28.1`, and conformance read 65 %), eu_ai_act_risk_tier `high`,
      eu_ai_act_role `provider_and_deployer`, sensitive_data true, autonomy_level
      `autonomous`, `inherit_resources` true, then PATCH `run_idle_timeout_seconds: 300`
      and `a2a_global_limits: {"chain": {"max_delegation_depth": 2}}`.
    - `brutor-demo-fraud-screener`, display "Brutor Demo Fraud Screener", kind agent,
      owner "Erik Holm, Financial Crime", risk tier `minimal`, role
-     `provider_and_deployer`, sensitive_data true, intended_clients
-     `["brutor-demo-system"]`, `inherit_resources` true.
+     `provider_and_deployer`, sensitive_data true, intended_client_systems
+     `[<brutor-demo-system gid>]` (typed intended clients, RFC 0022: the caller is an AI
+     System, declared by id), `inherit_resources` true.
    Never send `lifecycle_stage` on create. On re-runs PATCH `inherit_resources: true`
    if an existing system has it off (the API field is `inherit_resources`; the column
    is `inherit_from_parent`).
@@ -392,14 +440,51 @@ the first unrecoverable error and says which step. Control plane at `CP_URL`
 8. **Agent card.** `POST /v1/admin/agent-cards` with the card JSON from 5.4 (fetch the
    live card from the fraud agent's `/.well-known/agent-card.json` and submit that, so
    the two never drift), `POST /{id}/sign`, `PUT /{demo gid}/agent-cards
-   {"agent_card_ids": [id]}` (group-side binding, never the card-side PUT).
+   {"agent_card_ids": [id]}` (group-side binding, never the card-side PUT). The
+   fallback card (used only when the screener is unreachable) takes its `version` from
+   `brutor-demo-fraud-screener-agent/pyproject.toml`. On re-runs the stored card is
+   read back and `card_json` and the row's `version` column are PATCHed when they
+   differ (the control plane does not re-derive the column from a replaced body); the
+   PATCH drops the old signature (trust tier back to unsigned) and the `sign` call that
+   always follows signs the new body.
 9. **Agent identities and keys.** `brutor-demo-screening-worker` and
    `brutor-demo-fraud-screener` (default_deny true, enforcement_mode enforce, source
    manual), memberships to their systems, grants (section 7), then one API key per
    system: `POST /{gid}/api-keys {"name": "...", "access_mode": "shared", "agent_id": aid}`.
+   Each identity also declares its **implementation** (RFC 0023 §5.3):
+   `{"implementation_name": "<component distribution name>", "approved_versions":
+   ["<project.version from that component's pyproject.toml>"], "require_release": true}`
+   — `brutor-demo-screening-agent` on the worker, `brutor-demo-fraud-screener-agent` on
+   the screener. On create they are part of the POST; on re-runs the identity is read
+   back and only the fields that differ are PATCHed (then verified), because they are
+   in the contract closure: an unchanged re-run must not drift the contract.
    The plaintext is returned once; if the key already exists (409) and `.demo.env`
    has no value for it, the script rotates it by creating a key with a dated name and
    says so.
+   **9b. Composition (RFC 0022).** `POST /v1/admin/ai-systems/{demo gid}/dependencies`
+   `{"role": "shared_service", "depends_on_system_id": <fraud gid>, "agent_card_id":
+   <fraud card id>, "criticality": "critical", "contributes_to_decision": true,
+   "contract_pin": null, "supplier_legal_entity": null}`. On re-runs the existing
+   edge is PATCHed only where it differs. No `supplier_legal_entity` (same legal
+   entity) and no `assumptions` (they describe what a root assumes about a
+   dependency it cannot test — an external agent; the screener is tested, from its
+   segments). `contributes_to_decision: true` needs no separability rationale; had the
+   demo declared the screener non-contributing, the rationale would be sealed as a
+   declaration record and shown on both systems. With step 4's `intended_client_systems`, both sides have declared the
+   relationship, so the Composition tab shows it declared and observed. The
+   worker's `a2a_call` grant to the fraud card (section 7.1) is what the edge is
+   checked against: the composition checks (`grant_without_edge`,
+   `edge_without_grant`, `undeclared_dependency`, `unaccepted_caller`,
+   `dependency_pin_stale`) find nothing on a correctly provisioned demo, and each
+   one names exactly what is missing when something is.
+   `contract_pin: null` means the Demo System **follows** the screener's active
+   contract: its contract closure carries a `dependencies` section with the
+   screener's active contract `{id, version, hash}`, so when the screener promotes a
+   new contract the Demo System's contract drifts and its approver's diff shows
+   "dependency Brutor Demo Fraud Screener widened/narrowed: …" (the screener's own
+   classified diff). Pinning a contract id instead keeps the Demo System from
+   drifting and raises a `composition.dependency_pin_stale` finding when the
+   screener moves on.
 10. **Portal underwriter.** `POST /v1/admin/end-users` `underwriter` (`Underwriter123!`,
     display "Anna Berg (Underwriter)", `underwriter@borealis.example`,
     `send_welcome_email` false; 409 = exists), `POST /v1/admin/end-user-groups`
@@ -412,8 +497,11 @@ the first unrecoverable error and says which step. Control plane at `CP_URL`
     closure, end-user groups are not. `--no-portal-user` skips the step.
 11. **Governance.** Guardrail config, argument policy, limits, envelope (section 7).
 12. **Assurance.** Liveness (demo system: continuous, window 1800, grace 600,
-    expected_min_runs 1; fraud screener: on_demand). Response policy. Two continuous
-    checks (compile-checked first, enabled after creation).
+    expected_min_runs 1; fraud screener: on_demand — judged on whether it answers
+    the calls it receives, from its segments). Response policy. Two continuous
+    checks (compile-checked first, enabled after creation). The composition checks
+    need no setup: they run in the control plane's check tick and land in the
+    assurance inbox under category `composition`.
 13. **Compliance.** `PATCH /v1/admin/compliance/frameworks/eu-ai-act {"enabled": true}`
     and the same for `gdpr`. `PUT /v1/admin/compliance/ai-systems/{gid}/profile` for
     both systems (section 7.4). Evidence rows on the demo system: `impact_assessment`
@@ -421,11 +509,14 @@ the first unrecoverable error and says which step. Control plane at `CP_URL`
     `sha256` of the file, `uri` = the repo path, `assessor`, `produced_at`; list first,
     skip if a row of that kind and title exists. Notice config for the demo system.
     `POST /v1/admin/assets/sync`. Monthly EU AI Act report subscription.
-14. **Contract and gate.** For each system: mint (`POST /ai-systems/{gid}/contracts`),
-    approve, promote; `POST /ai-systems/{gid}/lifecycle {"to_stage": "approved",
-    "approved_by": <owner>}` then `{"to_stage": "active", ...}`. On 409 print
-    `detail.decision.unmet` and stop. Config changes after minting drift the contract,
-    so this step is last.
+14. **Contract and gate.** For each system, **the fraud screener first**: mint
+    (`POST /ai-systems/{gid}/contracts`), approve, promote;
+    `POST /ai-systems/{gid}/lifecycle {"to_stage": "approved", "approved_by":
+    <owner>}` then `{"to_stage": "active", ...}`. On 409 print `detail.decision.unmet`
+    and stop. Config changes after minting drift the contract, so this step is last;
+    and because the Demo System's contract carries the screener's active contract
+    (step 9b), the screener is promoted before the Demo System is minted, or the
+    Demo System would be drifted the moment setup finished.
 15. **Write `.demo.env`** (keys, ids, model names, the underwriter's portal credentials as
     `PORTAL_UNDERWRITER_USER` / `PORTAL_UNDERWRITER_PASSWORD`) and print the console
     paths to open.
@@ -498,6 +589,11 @@ Operating envelope (demo system): `max_cost_per_run_usd` 0.50, `max_llm_calls_pe
 
 Response policy (demo system): drift, severity ≥ high → `set_autonomy
 approval_required`, `require_human_to_restore` true, cooldown 3600, no suspend.
+The policy names no drift class, so it also covers the Demo System's `dependency`
+findings (RFC 0022 §7.4): when the fraud screener, a critical dependency, stops
+answering (severity critical) or fails one of its own signals (severity high), the
+Demo System drops to `approval_required` until a human restores it. The finding
+resolves itself when the screener is healthy again; the autonomy change does not.
 
 Continuous checks (tier A, demo system; run facts from `RUN_FACT_KEYS`):
 `run.guardrail_block_count > 0` (critical, "a guardrail fired inside a screening run"),
@@ -535,7 +631,8 @@ letter by the agent.
 
 | Article | What the demo does | Where to look |
 |---|---|---|
-| Art 6 + Annex III 5(b) | Declared high-risk creditworthiness system; the fraud screener declared minimal under the fraud carve-out | AI System → Compliance tab; profile |
+| Art 6 + Annex III 5(b) | Declared high-risk creditworthiness system; the fraud screener declared minimal under the fraud carve-out, but evaluated at its **effective** tier (high) because it contributes to the decision; "Classification of a composite system" statement on the Demo System | AI System → Compliance tab; profile; Composition tab (declared vs effective tier) |
+| Art 25(4) supplier agreements | Not required: the only dependency is the Borealis-run fraud screener (no `supplier_legal_entity`), so the statement reads "nothing to evaluate" | Compliance → Obligations |
 | Art 9 risk management | `docs/risk-assessment.md` on file as `risk_assessment` evidence; response policy downgrades autonomy on drift | Evidence rows; Response policies |
 | Art 10 data governance | `docs/data-governance.md`; synthetic data only; bureau reads sealed as sensitive reads | Evidence rows; Evidence Ledger |
 | Art 11 + Annex IV | Technical documentation export | `GET /v1/admin/ai-systems/{gid}/documentation?framework=eu-ai-act` |
@@ -603,6 +700,34 @@ stdin. Output is stdout in `result.content[0].text`.
 `{"message": ...}` to `{card url}/message:send` with `A2A-Version: 1.0` and relays the
 remote's JSON verbatim. Default timeout 30 s.
 
+**Agent release (RFC 0023).** The credential says *who* is calling and alone decides
+access; each agent also declares *what* software is calling and *which release*, on
+every gateway call it makes. The screening agent's LLM (both routes), MCP, skill, A2A,
+run-end and approval-poll calls, and the fraud screener's model call, carry:
+
+| Header | Value |
+|---|---|
+| `X-Brutor-Agent-Name` | the component's distribution name: `brutor-demo-screening-agent` / `brutor-demo-fraud-screener-agent` |
+| `X-Brutor-Agent-Version` | the installed distribution's version, `importlib.metadata.version(<name>)`, i.e. `project.version` in its `pyproject.toml` — the only place a version is written |
+| `X-Brutor-Agent-Build` | `BRUTOR_AGENT_BUILD` when non-empty (e.g. the git SHA), else omitted |
+
+The screening agent's MCP `tools/call` requests (the two MCP servers and the skills
+server) also carry the standard MCP carrier, `params._meta
+["io.modelcontextprotocol/clientInfo"] = {"name", "version"}`, which the gateway ranks
+above the headers (source `mcp_client_info`; the headers are source `header`; both
+trust `declared`). The agent sends no `initialize` (the servers are stateless, and a
+handshake would add a governed action to every run), so the per-request `_meta` is its
+only clientInfo. It sends no `X-Brutor-Client`: that header names a *channel* into a
+system, and the agent is the system's own member, not its client. Values stay inside
+the gateway's bounds (name `[a-z0-9._-]{1,64}`, version `[A-Za-z0-9.+_-]{1,64}`, build
+`[A-Za-z0-9:._-]{1,128}`); an agent refuses to start with a build outside them, and an
+agent that is not installed as a distribution refuses to start rather than guess a
+version. `BRUTOR_AGENT_BUILD` is a Dockerfile build arg (default empty) baked into the
+image as an env var; the compose file passes `${BRUTOR_AGENT_BUILD:-}` to both agent
+builds, so `BRUTOR_AGENT_BUILD=$(git rev-parse --short HEAD) ./demo.sh up` stamps both
+images. (An image cannot carry its own digest, so a git SHA is the practical build id.)
+Nothing the agents declare changes a grant or an access decision.
+
 **Approvals.** `GET {gw}/v1/portal/approvals/{id}/poll` with the API key returns
 `{"status": "pending|approved|rejected|expired", "approval_token"?}`. Retry the
 identical call with `X-Approval-Token`. One-time token.
@@ -619,6 +744,19 @@ identical call with `X-Approval-Token`. One-time token.
   the same run id and the last one carries Run-End.
 - Fraud agent: card served, both `message:send` spellings, chain headers echoed,
   sanctions hit → `hit`.
+- Agent release (both agents, `tests/test_identity.py`): the header names and the MCP
+  `_meta` key are pinned; every call type carries name and version (the screening
+  agent's fake gateway asserts it on every request, and clientInfo on every MCP call);
+  the version equals the installed metadata and the pyproject version; the build
+  follows `BRUTOR_AGENT_BUILD` and is omitted when empty; out-of-bounds builds and a
+  missing distribution refuse to start; the fraud screener never copies the caller's
+  agent headers, and its served card's version is the distribution version.
+- Setup and read-back (`brutor-demo-setup/tests`, fake control plane): the identity
+  declarations equal each component's pyproject name and version and converge only
+  what differs; the fallback card's version is the pyproject version; a new release
+  PATCHes the card body and version and re-signs; `verify.py` passes a declared demo,
+  warns while no release is observed, and fails on a differing declaration, non-empty
+  client labels, or an unapproved or misnamed current release.
 - `setup.py --dry-run` prints the plan without calling anything.
 - End-to-end (needs the trial stack): `demo.sh up`, wait one tick, `verify.py`
   expects ≥1 run with `chain_integrity` intact/client_asserted, `step_count` 8,
@@ -647,6 +785,50 @@ as an add-on against a trial stack. Compatibility is stated, not automated: the
 README names the platform version it was last verified against (0.10.93). If the
 demo ever gets its own GitHub repo and CI, that CI runs the demo's tests and may
 publish images under its own tags, independent of the platform release.
+
+## 10b. Releasing a new agent version (RFC 0023)
+
+A release is a `version` bump in the agent's `pyproject.toml` (and optionally a new
+build id); nothing else in the code carries a version. What the console shows:
+
+1. **Before approval.** Rebuild and restart the agent (`demo.sh up`, or `start` for
+   the screening agent). Its first run under the new `(name, version, build)` writes
+   an `agent.new_release` **lifecycle event** on the AI System (Lifecycle tab) and a
+   new row in the identity's **release timeline** (Agents → Identities →
+   `brutor-demo-screening-worker` → Implementation, trust badge `declared`). Because
+   the new version is not in `approved_versions`, every run on it raises
+   **`agent.unapproved_release`** in the Assurance inbox under **Agent** (severity high
+   on a high-risk system such as the Demo System, else medium). The Runs view shows
+   the release per run, and if behaviour shifts, drift names the `agent_release` cause
+   with both releases. A new build under the *same* version is a new release row and
+   event but no finding (approval is by version).
+2. **Approving it.** Either re-run `setup.py` (step 9 PATCHes `approved_versions` to
+   the new pyproject version, which drifts the contract once; step 14 re-mints,
+   approves and promotes it), or edit the approved versions in Admin on the identity's
+   Implementation section and approve the contract change. The finding clears once the
+   version is approved, or when 7 days pass without it.
+3. **What would be a real problem.** Runs that stop carrying a release raise
+   `agent.release_missing` (`require_release` is on); a different declared name raises
+   `agent.name_mismatch`; the same release suddenly behaving like different software
+   (a new implementation fingerprint after ≥ 20 runs) raises `agent.undeclared_change`.
+
+**A new fraud-screener release also changes its A2A card**, because the card's
+`version` is the release version. The next `setup.py` run fetches the live card, PATCHes
+the stored card body and version (which invalidates the old signature) and signs it
+again, so for the time between the new container starting and that run, the stored card
+is the previous release's while the screener serves the new one. Everything that refers
+to the card does so **by id** and is unaffected: the binding to the Demo System, the
+worker's `a2a_call` grant, the composition edge's `agent_card_id`, and the contract
+closure (which carries card ids, not card bodies). What does move the contract is the
+`approved_versions` change of step 9.
+
+`verify.py` shows all of this: `identity.<agent>` lines (✗ if a declaration differs
+from what setup.py declares), `client_labels` (✗ unless empty), and `release.<agent>`
+with the latest observed release, its trust, approval and run count (⚠ while none has
+been observed, ✗ if it is unapproved or names other software).
+
+The running demo keeps its release until its containers are rebuilt: these headers
+start flowing only with images built from this source.
 
 ## 11. What the demo does not claim
 

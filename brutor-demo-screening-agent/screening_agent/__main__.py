@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
     gw = Gateway(settings)
+    log.info("release %s (sent as X-Brutor-Agent-* headers and MCP clientInfo, RFC 0023)", gw.release.label())
     store = PendingApprovals(settings.data_dir)
 
     if args.application:

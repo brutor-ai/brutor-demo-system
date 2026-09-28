@@ -17,8 +17,12 @@ def main() -> int:
         log.warning("BRUTOR_API_KEY is empty: the model step will be skipped and verdicts will say llm_unavailable")
     import uvicorn
 
+    from .identity import current_release
+
+    release = current_release(settings.agent_build)
+    log.info("release %s (sent as X-Brutor-Agent-* headers, RFC 0023)", release.label())
     log.info("fraud screener on %s:%d (public %s), gateway %s, model %s", settings.bind_host, settings.port, settings.public_url, settings.gateway_url, settings.classifier_model)
-    uvicorn.run(create_app(settings), host=settings.bind_host, port=settings.port, log_level="warning")
+    uvicorn.run(create_app(settings, release=release), host=settings.bind_host, port=settings.port, log_level="warning")
     return 0
 
 

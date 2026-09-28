@@ -4,7 +4,11 @@
 Reads health, runs, assurance, contract, lifecycle gate, obligations, evidence,
 transparency, oversight, pending approvals and the Annex IV documentation
 export for the demo AI System, and checks the expectations in DESIGN.md
-section 9 against the most recent runs.
+section 9 against the most recent runs. It also reads back the agents'
+implementation identity (RFC 0023): each identity's declared implementation
+name, approved versions and require_release as setup.py declares them, the
+demo system's empty intended_client_labels, and the latest release the
+gateway observed per identity with its trust.
 
 Usage:
     python verify.py                 full report, exit 1 if an expectation fails
@@ -30,8 +34,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from setup import (  # noqa: E402  (shares the client and config with setup.py)
-    ADMIN_PASSWORD, ADMIN_USER, CP_URL, DEMO_SYSTEM_NAME, FRAUD_SYSTEM_NAME, GW_URL,
-    TENANT_ID, Client, StepError, find, listing, read_demo_env,
+    ADMIN_PASSWORD, ADMIN_USER, CP_URL, DEMO_SYSTEM_NAME, FRAUD_DIST, FRAUD_IDENTITY,
+    FRAUD_SYSTEM_NAME, GW_URL, SCREENING_DIST, SCREENING_IDENTITY, TENANT_ID, Client,
+    StepError, find, implementation_declaration, listing, read_demo_env,
+)
+
+# (label, identity name, component distribution) per agent (RFC 0023).
+AGENT_RELEASES = (
+    ("screening", SCREENING_IDENTITY, SCREENING_DIST),
+    ("fraud", FRAUD_IDENTITY, FRAUD_DIST),
 )
 
 # A full run declares 3 steps (gather, assess, decide) and 3 turns (t1 and t2
@@ -81,6 +92,55 @@ class Report:
     def detail(self, text: str) -> None:
         if not self.brief:
             print(f"    {text}")
+
+
+def check_agent_releases(cp: Client, rep: "Report", gid: str) -> None:
+    """RFC 0023 read-back. Declarations must be exactly what setup.py declares
+    (✗ otherwise). The latest observed release is ⚠ while none has been seen
+    (images older than the RFC, or no run yet), ✓ when approved under the
+    declared name, ✗ when it is unapproved or names other software."""
+    cp.step = "client_labels"
+    _, group = cp.get(f"/v1/admin/resource-groups/{gid}", tolerate=(404,))
+    group = group if isinstance(group, dict) else {}
+    labels = group.get("intended_client_labels")
+    rep.line("client_labels", f"{DEMO_SYSTEM_NAME} intended_client_labels={labels} "
+                              "(its own agent is judged on its release)", labels == [])
+
+    cp.step = "agent_release"
+    _, resp = cp.get("/v1/admin/agent-identities")
+    agents = listing(resp, "agents")
+    for label, name, dist in AGENT_RELEASES:
+        want = implementation_declaration(dist)
+        row = find(agents, name=name)
+        if not row:
+            rep.line(f"identity.{label}", f"{name} not found; run setup.py", False)
+            continue
+        aid = row["id"]
+        _, detail = cp.get(f"/v1/admin/agent-identities/{aid}", tolerate=(404,))
+        detail = detail if isinstance(detail, dict) else {}
+        have = {k: detail.get(k) for k in want}
+        rep.line(f"identity.{label}", f"{name} implementation={have['implementation_name']} "
+                                      f"approved={have['approved_versions']} "
+                                      f"require_release={have['require_release']}", have == want)
+        if have != want:
+            rep.detail(f"setup.py declares {want}")
+
+        _, rel = cp.get(f"/v1/admin/agent-identities/{aid}/releases", tolerate=(404,))
+        rel = rel if isinstance(rel, dict) else {}
+        releases = listing(rel, "releases")
+        current = next((r for r in releases if r.get("current")), releases[0] if releases else None)
+        if current is None:
+            rep.line(f"release.{label}", "none observed yet (agent image predates RFC 0023, or no run yet)", None)
+            continue
+        approved = current.get("approved")
+        name_ok = current.get("name_matches")
+        good = None if approved is None else (approved is True and name_ok is not False)
+        rep.line(f"release.{label}", f"{current.get('label')} trust={current.get('trust')} "
+                                     f"approved={approved} runs={current.get('run_count')} "
+                                     f"last_seen={current.get('last_seen_at')}", good)
+        for r in releases[1:5]:
+            rep.detail(f"earlier {r.get('label')} trust={r.get('trust')} approved={r.get('approved')} "
+                       f"runs={r.get('run_count')} first_seen={r.get('first_seen_at')}")
 
 
 def main() -> int:
@@ -266,6 +326,8 @@ def main() -> int:
         rep.line("documentation", f"Annex IV export readable ({n} section(s))", True)
     else:
         rep.line("documentation", "not readable", None)
+
+    check_agent_releases(cp, rep, gid)
 
     if fraud_gid:
         _, fl = cp.get(f"/v1/admin/ai-systems/{fraud_gid}/lifecycle", tolerate=(404,))

@@ -111,6 +111,13 @@ the applicant id and the verdict. The model call logs one line with status and l
 | `A2A_PORT` | `9200` | port |
 | `LLM_TIMEOUT_SECONDS` | `20` | model call timeout |
 | `LOG_LEVEL` | `INFO` | logging level |
+| `BRUTOR_AGENT_BUILD` | empty | build id of this release (e.g. git SHA), sent as `X-Brutor-Agent-Build`; baked into the image by the Dockerfile build arg of the same name |
+
+Its model call names this agent's implementation and release (RFC 0023):
+`X-Brutor-Agent-Name: brutor-demo-fraud-screener-agent`, `X-Brutor-Agent-Version` = the
+installed distribution version (`project.version` in `pyproject.toml`) and
+`X-Brutor-Agent-Build` when set. The caller's agent headers are never copied. See
+`fraud_screener/identity.py` and ../DESIGN.md section 8.
 
 ## Run locally
 

@@ -254,7 +254,16 @@ class Scheduler:
         from starlette.routing import Route
 
         async def health(_request):
-            return JSONResponse({"status": "ok", "agent": "brutor-demo-screening-agent", "ticks": self.status["ticks"]})
+            release = self.gw.release
+            return JSONResponse(
+                {
+                    "status": "ok",
+                    "agent": release.name,
+                    "version": release.version,
+                    "build": release.build,
+                    "ticks": self.status["ticks"],
+                }
+            )
 
         async def status(_request):
             body = dict(self.status)

@@ -22,12 +22,14 @@ def test_ulid_shape():
         assert re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", u)
 
 
-def test_headers_outside_run_have_auth_only(settings):
+def test_headers_outside_run_have_auth_and_release_only(settings):
     gw = Gateway(settings)
     h = gw.headers()
     assert h["Authorization"] == f"Bearer {settings.api_key}"
     assert h["X-Tenant-ID"] == "default"
-    assert not any(k.lower().startswith("x-brutor-") for k in h)
+    # the agent release (RFC 0023) is on every call; no run correlation outside a run
+    assert h["X-Brutor-Agent-Name"] == "brutor-demo-screening-agent"
+    assert {k for k in h if k.lower().startswith("x-brutor-")} <= {"X-Brutor-Agent-Name", "X-Brutor-Agent-Version", "X-Brutor-Agent-Build"}
     with pytest.raises(ValueError):
         gw.headers("intake", "Load")
 

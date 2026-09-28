@@ -16,6 +16,7 @@ import httpx
 
 from screening_agent.config import Settings
 from screening_agent.gateway import Gateway
+from screening_agent.identity import DISTRIBUTION, MCP_CLIENT_INFO_META_KEY
 from screening_agent.prompts import DISCLOSURE
 
 SAMPLE_APPLICATION: dict[str, Any] = {
@@ -148,6 +149,9 @@ class FakeGateway:
         self.calls.append(call)
         assert call.headers.get("authorization", "").startswith("Bearer sk_brutor_api_"), "missing Brutor bearer key"
         assert call.headers.get("x-brutor-run-end", "").lower() != "true", "X-Brutor-Run-End: true is banned"
+        # RFC 0023: the agent names its implementation and release on every call.
+        assert call.headers.get("x-brutor-agent-name") == DISTRIBUTION, "missing X-Brutor-Agent-Name"
+        assert call.headers.get("x-brutor-agent-version"), "missing X-Brutor-Agent-Version"
         path = request.url.path
         if path == "/v1/proxy/llm/chat/completions":
             return self._llm(body)
@@ -242,6 +246,8 @@ class FakeGateway:
         return httpx.Response(status, json={"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}], "isError": is_error}})
 
     def _mcp(self, server: str, body: dict[str, Any], call: Call) -> httpx.Response:
+        client_info = (body["params"].get("_meta") or {}).get(MCP_CLIENT_INFO_META_KEY) or {}
+        assert client_info.get("name") == DISTRIBUTION and client_info.get("version"), "MCP call without clientInfo"
         tool = body["params"]["name"]
         args = body["params"].get("arguments") or {}
         if tool == self.block_tool:

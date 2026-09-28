@@ -9,7 +9,9 @@ orchestrating agent declares them, and a delegate cannot know which phase it
 serves. The ledger counts distinct step and turn ids across all depths, so a
 delegate step would inflate the caller's step count.
 The agent authenticates with its own API key, so the action is attributed to
-the fraud screener system while landing in the caller's run.
+the fraud screener system while landing in the caller's run. It also names its
+own implementation and release (X-Brutor-Agent-Name/-Version/-Build, RFC 0023,
+identity.py); the caller's agent headers are never copied.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from typing import Any, Iterable, Mapping
 import httpx
 
 from .config import Settings
+from .identity import AGENT_HEADER_PREFIX, AgentRelease
 
 log = logging.getLogger("fraud_screener.llm")
 
@@ -62,7 +65,7 @@ def delegation_headers(inbound: Mapping[str, str] | Iterable[tuple[str, str]]) -
     return {k.lower(): v for k, v in items if k.lower().startswith(DELEGATION_PREFIX)}
 
 
-def build_headers(settings: Settings, inbound: Mapping[str, str]) -> dict[str, str]:
+def build_headers(settings: Settings, inbound: Mapping[str, str], release: AgentRelease) -> dict[str, str]:
     chain = delegation_headers(inbound)
     headers = {
         "Authorization": f"Bearer {settings.api_key}",
@@ -71,8 +74,10 @@ def build_headers(settings: Settings, inbound: Mapping[str, str]) -> dict[str, s
         **chain,
         "X-Brutor-Turn-Id": f"t01-{TURN_LABEL}-{new_ulid()[-10:]}",
         "X-Brutor-Turn-Seq": "1",
+        **release.headers(),
     }
     lowered = {k.lower() for k in headers}
+    assert {k for k in lowered if k.startswith(AGENT_HEADER_PREFIX)} == {k.lower() for k in release.headers()}
     assert RUN_ID_HEADER not in lowered
     assert "x-brutor-step-id" not in lowered and "x-brutor-step-name" not in lowered
     return headers
@@ -113,6 +118,7 @@ async def fraud_indicators(
     settings: Settings,
     payload: dict[str, Any],
     inbound_headers: Mapping[str, str],
+    release: AgentRelease,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -121,7 +127,7 @@ async def fraud_indicators(
     if not settings.api_key:
         return None, "no BRUTOR_API_KEY configured"
     url = f"{settings.gateway_url}/v1/proxy/llm/chat/completions"
-    headers = build_headers(settings, inbound_headers)
+    headers = build_headers(settings, inbound_headers, release)
     body = build_body(settings, payload)
     chain_depth = headers.get("x-brutor-delegation-depth", "-")
     started = time.monotonic()

@@ -20,6 +20,14 @@ COPY pyproject.toml README.md ./
 COPY screening_agent ./screening_agent
 RUN pip install --no-cache-dir .
 
+# The release's build id (RFC 0023), sent as X-Brutor-Agent-Build next to the
+# name and version (those come from pyproject.toml via the installed metadata).
+# Pass e.g. the git SHA: docker build --build-arg BRUTOR_AGENT_BUILD=$(git rev-parse HEAD).
+# Empty (the default) sends no build header. Declared after the install so a new
+# build id does not invalidate the dependency layer.
+ARG BRUTOR_AGENT_BUILD=""
+ENV BRUTOR_AGENT_BUILD=${BRUTOR_AGENT_BUILD}
+
 USER agent
 VOLUME ["/data"]
 EXPOSE 9201

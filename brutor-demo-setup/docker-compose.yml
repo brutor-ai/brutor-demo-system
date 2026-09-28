@@ -47,7 +47,12 @@ services:
       - brutor-network
 
   fraud-screener-agent:
-    build: ../brutor-demo-fraud-screener-agent
+    build:
+      context: ../brutor-demo-fraud-screener-agent
+      args:
+        # RFC 0023 release build id (e.g. the git SHA), baked into the image and
+        # sent as X-Brutor-Agent-Build. Empty = no build header.
+        BRUTOR_AGENT_BUILD: "${BRUTOR_AGENT_BUILD:-}"
     image: brutor-demo-fraud-screener-agent:local
     container_name: brutor-demo-fraud-screener-agent
     restart: unless-stopped
@@ -70,7 +75,12 @@ services:
       - brutor-network
 
   screening-agent:
-    build: ../brutor-demo-screening-agent
+    build:
+      context: ../brutor-demo-screening-agent
+      args:
+        # RFC 0023 release build id (e.g. the git SHA), baked into the image and
+        # sent as X-Brutor-Agent-Build. Empty = no build header.
+        BRUTOR_AGENT_BUILD: "${BRUTOR_AGENT_BUILD:-}"
     image: brutor-demo-screening-agent:local
     container_name: brutor-demo-screening-agent
     restart: unless-stopped

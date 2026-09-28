@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from .config import Settings
+from .identity import AgentRelease, current_release
 from .llm import DELEGATION_PREFIX, fraud_indicators
 from .screening import verdict_for
 
@@ -23,7 +24,10 @@ SKILL_ID = "screening.fraud_sanctions"
 AGENT_NAME = "Brutor Demo Fraud Screener"
 
 
-def build_agent_card(public_url: str) -> dict[str, Any]:
+def build_agent_card(public_url: str, version: str) -> dict[str, Any]:
+    """The A2A card. `version` is the release version (identity.py: the installed
+    distribution's, i.e. pyproject.toml), so the card, the X-Brutor-Agent-Version
+    header and the identity's approved_versions all name the same release."""
     return {
         "name": AGENT_NAME,
         "description": (
@@ -32,7 +36,7 @@ def build_agent_card(public_url: str) -> dict[str, Any]:
             "call for fraud indicators in the stated purpose. Part of the Brutor "
             "Demo System; not a real fraud detector."
         ),
-        "version": "1.0.0",
+        "version": version,
         "protocolVersion": "1.0",
         "url": public_url,
         "supportedInterfaces": [
@@ -110,12 +114,21 @@ def task_response(verdict: dict[str, Any], *, state: str = "TASK_STATE_COMPLETED
     }
 
 
-def create_app(settings: Settings | None = None, *, http_client: httpx.AsyncClient | None = None) -> Starlette:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    http_client: httpx.AsyncClient | None = None,
+    release: AgentRelease | None = None,
+) -> Starlette:
     settings = settings or Settings.from_env()
-    card = build_agent_card(settings.public_url)
+    # RFC 0023: name + installed version (+ BRUTOR_AGENT_BUILD) on every outbound call.
+    release = release or current_release(settings.agent_build)
+    card = build_agent_card(settings.public_url, release.version)
 
     async def health(_request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "agent": "brutor-demo-fraud-screener-agent", "skill": SKILL_ID})
+        return JSONResponse(
+            {"status": "ok", "agent": release.name, "version": release.version, "build": release.build, "skill": SKILL_ID}
+        )
 
     async def agent_card(_request: Request) -> JSONResponse:
         return JSONResponse(card)
@@ -136,7 +149,7 @@ def create_app(settings: Settings | None = None, *, http_client: httpx.AsyncClie
             return JSONResponse({"error": "message has no text part"}, status_code=400)
         payload = parse_payload(text)
 
-        llm_result, llm_error = await fraud_indicators(settings, payload, request.headers, client=http_client)
+        llm_result, llm_error = await fraud_indicators(settings, payload, request.headers, release, client=http_client)
         model_used = settings.classifier_model if llm_result is not None else None
         verdict = verdict_for(payload, llm_result, llm_error, model_used)
         log.info(

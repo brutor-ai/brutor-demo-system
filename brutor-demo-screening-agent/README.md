@@ -155,8 +155,18 @@ single-turn (`t1`), single-action runs.
 | `DATA_DIR` | `/data` | pending approvals, retry tracker |
 | `HEALTH_PORT` | `9201` | health server port |
 | `LOG_LEVEL` | `INFO` | logging level |
+| `BRUTOR_AGENT_BUILD` | empty | build id of this release (e.g. git SHA), sent as `X-Brutor-Agent-Build`; baked into the image by the Dockerfile build arg of the same name |
 
-`brutor-demo-setup/setup.py` writes all of these into `.demo.env`.
+`brutor-demo-setup/setup.py` writes all of these into `.demo.env`, except
+`BRUTOR_AGENT_BUILD`, which comes from the image build.
+
+Every gateway call names this agent's implementation and release (RFC 0023):
+`X-Brutor-Agent-Name: brutor-demo-screening-agent`, `X-Brutor-Agent-Version` = the
+installed distribution version (`project.version` in `pyproject.toml`, the only place
+it is written) and `X-Brutor-Agent-Build` when set; MCP calls also carry
+`params._meta["io.modelcontextprotocol/clientInfo"] = {name, version}`. The agent must
+be installed (`pip install .` or `-e .`) so its version can be read; see
+`screening_agent/identity.py` and ../DESIGN.md section 8.
 
 ## Run locally
 

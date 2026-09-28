@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import time
+import tomllib
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -113,6 +114,12 @@ SCREENING_IDENTITY = "brutor-demo-screening-worker"
 FRAUD_IDENTITY = "brutor-demo-fraud-screener"
 SCREENING_KEY_NAME = "brutor-demo-screening-agent"
 FRAUD_KEY_NAME = "brutor-demo-fraud-screener-agent"
+# The agents' implementation names (RFC 0023): each component's distribution
+# name, which the agent sends as X-Brutor-Agent-Name / MCP clientInfo.name.
+# The approved version is read from the same pyproject.toml the agent's
+# installed metadata comes from, so the two can never disagree.
+SCREENING_DIST = "brutor-demo-screening-agent"
+FRAUD_DIST = "brutor-demo-fraud-screener-agent"
 GUARDRAIL_NAME = "Brutor Demo Screening Guardrails"
 BASELINE_GUARDRAIL_NAME = "Borealis Baseline Guardrails"
 ARG_POLICY_NAME = "Adverse or large decisions need an underwriter"
@@ -218,12 +225,25 @@ EVIDENCE = [
      "Model Validation, Borealis Consumer Finance AB"),
 ]
 
+def component_version(dist: str) -> str:
+    """`project.version` of brutor-demo-system/<dist>/pyproject.toml: the version
+    the agent reports (its installed metadata is built from this file)."""
+    path = os.path.join(SYSTEM_ROOT, dist, "pyproject.toml")
+    with open(path, "rb") as fh:
+        project = tomllib.load(fh).get("project") or {}
+    if project.get("name") != dist or not project.get("version"):
+        raise ValueError(f"{path}: expected project.name {dist!r} and a project.version")
+    return str(project["version"])
+
+
 # Fallback card if the fraud agent is not reachable during provisioning
-# (DESIGN.md section 5.4). The live card is always preferred.
+# (DESIGN.md section 5.4). The live card is always preferred. Its version is
+# the fraud screener's release version, read from the same pyproject.toml the
+# served card's version comes from (RFC 0023: one source for the release).
 FALLBACK_FRAUD_CARD = {
     "name": "Brutor Demo Fraud Screener",
     "description": "Fraud and sanctions screening for consumer loan applications.",
-    "version": "1.0.0",
+    "version": component_version(FRAUD_DIST),
     "protocolVersion": "1.0",
     "url": FRAUD_CONTAINER_URL,
     "supportedInterfaces": [{
@@ -372,6 +392,17 @@ def now_iso() -> str:
 def plus_days_iso(days: int) -> str:
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)).replace(
         microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def implementation_declaration(dist: str) -> Dict[str, Any]:
+    """The identity's implementation fields (RFC 0023 section 5.3): the name the
+    software must declare, the one approved version (the current release), and
+    require_release so a call without a release is a finding."""
+    return {
+        "implementation_name": dist,
+        "approved_versions": [component_version(dist)],
+        "require_release": True,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -607,7 +638,11 @@ class Provisioner:
                 "group_type": "ai_system", "system_kind": "agent",
                 "parent_group_id": parent, "inherit_resources": True,
                 "owner": DEMO_OWNER, "intended_use": INTENDED_USE,
-                "intended_clients": ["brutor-demo-screening-agent"],
+                # Its only caller is its own member agent, which the platform
+                # judges on implementation and release (RFC 0023), never as a
+                # client label. Declared explicitly empty so a re-run converges
+                # the field away from the earlier ["brutor-demo-screening-agent"].
+                "intended_client_labels": [],
                 "eu_ai_act_risk_tier": "high", "eu_ai_act_role": "provider_and_deployer",
                 "sensitive_data": True, "autonomy_level": "autonomous",
             }),
@@ -617,23 +652,32 @@ class Provisioner:
                 "group_type": "ai_system", "system_kind": "agent",
                 "parent_group_id": parent, "inherit_resources": True,
                 "owner": FRAUD_OWNER, "intended_use": FRAUD_INTENDED_USE,
-                "intended_clients": [DEMO_SYSTEM_NAME],
+                # Typed (RFC 0022): the caller is an AI System, so it is
+                # declared by id once the demo system exists (see the loop).
+                "intended_client_systems": None,
+                # …and it serves no non-system clients. Declared explicitly so
+                # a re-run converges the field (an omitted key is never
+                # compared, so a stale label would survive forever).
+                "intended_client_labels": [],
                 "eu_ai_act_risk_tier": "minimal", "eu_ai_act_role": "provider_and_deployer",
                 "sensitive_data": True, "autonomy_level": "autonomous",
             }),
         ]
         for label, name, body in specs:
             self.step(f"ai_system.{label}")
+            if label == "fraud":
+                body["intended_client_systems"] = [self.ids["demo_group_id"]]
             rows = self.groups()
             existing = find(rows, name=name)
             if existing:
                 gid = existing["id"]
                 # Converge the declarations (only the ones that differ, so an
                 # unchanged system does not drift its contract on a re-run).
-                delta = {k: body[k] for k in ("owner", "intended_use", "intended_clients",
+                delta = {k: body[k] for k in ("owner", "intended_use", "intended_client_labels",
+                                              "intended_client_systems",
                                               "eu_ai_act_risk_tier", "eu_ai_act_role",
                                               "sensitive_data", "autonomy_level", "system_kind")
-                         if existing.get(k) != body[k]}
+                         if k in body and existing.get(k) != body[k]}
                 if existing.get("parent_group_id") != parent:
                     delta["parent_group_id"] = parent
                 # Inherit the org's model, limits and baseline guardrails (the
@@ -918,18 +962,29 @@ class Provisioner:
 
         _, resp = self.cp.get("/v1/admin/agent-cards")
         existing = find(listing(resp, "cards"), name=FRAUD_CARD_NAME)
+        # The card's version is the screener's release version (RFC 0023), so a
+        # new release changes the card body: it is PATCHed here (which drops
+        # the old signature, trust tier back to unsigned) and re-signed below.
+        # The row's `version` column is PATCHed with it; the control plane
+        # does not re-derive the column from a replaced card_json.
+        version = str(card_json.get("version") or component_version(FRAUD_DIST))
         if existing:
             cid = existing["id"]
             _, detail = self.cp.get(f"/v1/admin/agent-cards/{cid}", tolerate=(404,))
-            have = (detail or {}).get("card_json") if isinstance(detail, dict) else None
-            if have != card_json:
-                self.cp.patch(f"/v1/admin/agent-cards/{cid}", {"card_json": card_json}, tolerate=(400, 409, 422))
-                ok("agent_card", f"{FRAUD_CARD_NAME} ({cid}) card_json refreshed")
+            detail = detail if isinstance(detail, dict) else {}
+            delta: Dict[str, Any] = {}
+            if detail.get("card_json") != card_json:
+                delta["card_json"] = card_json
+            if detail.get("version") != version:
+                delta["version"] = version
+            if delta:
+                self.cp.patch(f"/v1/admin/agent-cards/{cid}", delta, tolerate=(400, 409, 422))
+                ok("agent_card", f"{FRAUD_CARD_NAME} ({cid}) refreshed {sorted(delta)}, version {version}")
             else:
-                ok("agent_card", f"{FRAUD_CARD_NAME} ({cid})")
+                ok("agent_card", f"{FRAUD_CARD_NAME} ({cid}) version {version}")
         else:
             status, resp = self.cp.post("/v1/admin/agent-cards", {
-                "name": FRAUD_CARD_NAME, "version": card_json.get("version", "1.0.0"),
+                "name": FRAUD_CARD_NAME, "version": version,
                 "description": "Fraud & Sanctions Screener: the A2A peer the demo system delegates to.",
                 "card_json": card_json, "enabled": True,
             }, tolerate=(409,))
@@ -949,6 +1004,51 @@ class Provisioner:
         self.cp.put(f"/v1/admin/resource-groups/{gid}/agent-cards", {"agent_card_ids": [cid]},
                     tolerate=(400, 409))
         ok("agent_card.bind", f"{FRAUD_CARD_NAME} -> {DEMO_SYSTEM_NAME}")
+
+    # -- 9b. composition: the fraud screener is a critical shared service -----
+    def composition(self) -> None:
+        """Declare the Demo System's dependency on the Fraud Screener (RFC 0022 §5.2).
+
+        The screener is its own AI System, so the edge is `shared_service`;
+        the demo cannot decide without its verdict, so `critical`; and its
+        verdict drives declines, so it contributes to the decision — which
+        makes its effective risk tier the Demo System's (high), and the
+        obligation registry evaluates it AT that tier (RFC 0022 Phase 3): its
+        declared "minimal" (Art 6(3)) stays on its profile as a visible claim,
+        the high-risk obligations apply to it anyway. It is built and run by
+        the same legal entity as the Demo System (Borealis), so the edge names
+        no `supplier_legal_entity` and needs no Art 25(4) supplier agreement.
+        The serving side accepts the caller through `intended_client_systems`
+        (step 4).
+        """
+        section("9b. Composition")
+        self.step("composition")
+        gid = self.ids["demo_group_id"]
+        want = {
+            "role": "shared_service",
+            "depends_on_system_id": self.ids["fraud_group_id"],
+            "agent_card_id": self.ids["fraud_card_id"],
+            "criticality": "critical",
+            "contributes_to_decision": True,
+            "contract_pin": None,
+            # Same legal entity: no supplier (RFC 0022 Phase 3, Art 25(4)).
+            "supplier_legal_entity": None,
+        }
+        _, resp = self.cp.get(f"/v1/admin/ai-systems/{gid}/dependencies")
+        edge = find(listing(resp, "dependencies"), depends_on_system_id=want["depends_on_system_id"])
+        if edge is None:
+            status, resp = self.cp.post(f"/v1/admin/ai-systems/{gid}/dependencies", want, tolerate=(409,))
+            if status >= 400:
+                raise StepError("composition", f"declare dependency: HTTP {status}: {_short(resp, 300)}")
+            ok("composition.edge", f"{DEMO_SYSTEM_NAME} -> {FRAUD_SYSTEM_NAME} (shared service, critical) declared")
+            return
+        delta = {k: v for k, v in want.items()
+                 if k not in ("role", "depends_on_system_id") and edge.get(k) != v}
+        if delta:
+            self.cp.patch(f"/v1/admin/ai-systems/{gid}/dependencies/{edge['id']}", delta, tolerate=(422,))
+            ok("composition.edge", f"updated {sorted(delta)}")
+        else:
+            ok("composition.edge", f"{DEMO_SYSTEM_NAME} -> {FRAUD_SYSTEM_NAME} ({edge['id']})")
 
     # -- 9. identities and keys --------------------------------------------
     def identities_and_keys(self) -> None:
@@ -976,11 +1076,11 @@ class Provisioner:
 
         aid = self._ensure_identity("screening", SCREENING_IDENTITY,
                                     "The screening agent's workload identity (LangGraph process).",
-                                    "Credit Risk", demo_gid, screening_grants)
+                                    "Credit Risk", demo_gid, screening_grants, SCREENING_DIST)
         self.ids["screening_agent_id"] = aid
         fid = self._ensure_identity("fraud", FRAUD_IDENTITY,
                                     "The fraud screener's workload identity (A2A remote agent).",
-                                    "Financial Crime", fraud_gid, fraud_grants)
+                                    "Financial Crime", fraud_gid, fraud_grants, FRAUD_DIST)
         self.ids["fraud_agent_id"] = fid
 
         self.ids["screening_api_key"] = self._ensure_key(
@@ -989,8 +1089,12 @@ class Provisioner:
             "fraud", fraud_gid, FRAUD_KEY_NAME, fid, self.env.get("FRAUD_BRUTOR_API_KEY"))
 
     def _ensure_identity(self, label: str, name: str, description: str, owner: str,
-                         gid: str, grants: List[tuple]) -> str:
+                         gid: str, grants: List[tuple], dist: str) -> str:
         self.step(f"identity.{label}")
+        try:
+            implementation = implementation_declaration(dist)
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+            raise StepError(f"identity.{label}", f"cannot read the {dist} release: {exc}")
         _, resp = self.cp.get("/v1/admin/agent-identities")
         existing = find(listing(resp, "agents"), name=name)
         if existing:
@@ -1000,6 +1104,7 @@ class Provisioner:
             status, resp = self.cp.post("/v1/admin/agent-identities", {
                 "name": name, "description": description, "owner_label": owner,
                 "source": "manual", "default_deny": True, "enforcement_mode": "enforce",
+                **implementation,
             }, tolerate=(409,))
             aid = ident(resp, "agent")
             if not aid:
@@ -1008,6 +1113,7 @@ class Provisioner:
             if not aid:
                 raise StepError(f"identity.{label}", f"could not resolve {name} after create (HTTP {status})")
             ok(f"identity.{label}", f"{name} ({aid}) created, default-deny, enforce")
+        self._converge_implementation(label, aid, implementation)
 
         self.cp.post(f"/v1/admin/agent-identities/{aid}/memberships",
                      {"group_id": gid, "role": "member"}, tolerate=(400, 409))
@@ -1024,6 +1130,30 @@ class Provisioner:
             added += 1
         ok(f"identity.{label}.grants", f"{len(grants)} grant(s), {added} added")
         return aid
+
+    def _converge_implementation(self, label: str, aid: str, want: Dict[str, Any]) -> None:
+        """RFC 0023: the identity declares the implementation its software must
+        name and the release(s) the approver accepts. Only differing fields are
+        PATCHed: these fields are in the AI System's contract closure, so an
+        unchanged re-run must not drift the contract, and a new release (a
+        pyproject version bump) drifts it exactly once, to be re-approved in
+        step 14. Until then the gateway raises agent.unapproved_release."""
+        step = f"identity.{label}.implementation"
+        self.step(step)
+        _, cur = self.cp.get(f"/v1/admin/agent-identities/{aid}")
+        cur = cur if isinstance(cur, dict) else {}
+        delta = {k: v for k, v in want.items() if cur.get(k) != v}
+        summary = (f"{want['implementation_name']} approved {want['approved_versions']}, "
+                   f"require_release {str(want['require_release']).lower()}")
+        if not delta:
+            ok(step, summary)
+            return
+        _, after = self.cp.patch(f"/v1/admin/agent-identities/{aid}", delta)
+        after = after if isinstance(after, dict) else {}
+        still = sorted(k for k, v in want.items() if after.get(k) != v)
+        if still:
+            raise StepError(step, f"control plane did not keep {still}: {_short(after, 300)}")
+        ok(step, f"{summary} (converged {sorted(delta)})")
 
     def _ensure_key(self, label: str, gid: str, name: str, agent_id: str,
                     known_value: Optional[str]) -> str:
@@ -1511,7 +1641,11 @@ class Provisioner:
         if self.skip_lifecycle:
             warn("lifecycle", "--skip-lifecycle given; contracts not minted, stages unchanged")
             return
-        for label, owner in (("demo", DEMO_OWNER), ("fraud", FRAUD_OWNER)):
+        # The service first (RFC 0022 §5.3): the demo system's contract carries
+        # the fraud screener's ACTIVE contract hash (its dependency edge follows
+        # it), so promoting the screener after the demo system would leave the
+        # demo system config-drifted the moment setup finished.
+        for label, owner in (("fraud", FRAUD_OWNER), ("demo", DEMO_OWNER)):
             gid = self.ids[f"{label}_group_id"]
             self.step(f"contract.{label}")
             _, resp = self.cp.post(f"/v1/admin/ai-systems/{gid}/contracts", {}, tolerate=(409,))
@@ -1603,6 +1737,7 @@ class Provisioner:
         self.skill()
         self.agent_card()
         self.identities_and_keys()
+        self.composition()
         self.portal_underwriter()
         self.governance()
         self.assurance()
@@ -1664,6 +1799,15 @@ def _drop_path(profile: Dict[str, Any], path: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Dry run
 # --------------------------------------------------------------------------- #
+def _implementation_plan(dist: str) -> str:
+    try:
+        want = implementation_declaration(dist)
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        return f"{dist} UNREADABLE ({exc})"
+    return (f"implementation_name {want['implementation_name']}, approved_versions "
+            f"{want['approved_versions']}, require_release true")
+
+
 def dry_run(residency: bool, skip_lifecycle: bool, portal_user: bool = True) -> None:
     print(f"Brutor Demo System provisioning plan (dry run; nothing is called)")
     print(f"  control plane {CP_URL}   gateway {GW_URL}   tenant {TENANT_ID}   admin {ADMIN_USER}")
@@ -1678,7 +1822,8 @@ def dry_run(residency: bool, skip_lifecycle: bool, portal_user: bool = True) -> 
                       "import from /v1/admin/llm-catalog if missing"),
         ("3. org_unit", f"POST /v1/admin/resource-groups {ORG_NAME} (organization, '{ORG_DISPLAY}'); bind "
                         f"{CLASSIFIER_MODEL} to the org; org limits 50/1000 USD, 120 rpm, concurrency 4, 2000 mcp/h"),
-        ("4. ai_systems", f"{DEMO_SYSTEM_NAME} (agent, high, provider_and_deployer, sensitive, autonomous, inherit_resources; "
+        ("4. ai_systems", f"{DEMO_SYSTEM_NAME} (agent, high, provider_and_deployer, sensitive, autonomous, inherit_resources, "
+                          "intended_client_labels [] (its only caller is its own agent, judged on its release); "
                           f"then PATCH run_idle_timeout_seconds=300, a2a chain depth 2) and "
                           f"{FRAUD_SYSTEM_NAME} (agent, minimal)"),
         ("5. bind_models", f"{DRAFTER_MODEL} -> demo (direct, portal_visible false); {CLASSIFIER_MODEL} inherited from the org "
@@ -1688,10 +1833,19 @@ def dry_run(residency: bool, skip_lifecycle: bool, portal_user: bool = True) -> 
                            f"server configs; discover; enable every tool; bind {SKILLS_CONFIG_ID}"),
         ("7. skill", f"{SKILL_NAME}: SKILL.md + affordability.py (sandbox) + policy.md; validate; publish; -> demo"),
         ("8. agent_card", f"{FRAUD_CARD_NAME}: live card from {FRAUD_HOST_URL}/.well-known/agent-card.json "
-                          "(fallback DESIGN 5.4); sign; PUT /resource-groups/{demo}/agent-cards"),
+                          f"(fallback DESIGN 5.4, version {FALLBACK_FRAUD_CARD['version']} from "
+                          f"{FRAUD_DIST}/pyproject.toml); PATCH card_json + version when they differ; "
+                          "sign; PUT /resource-groups/{demo}/agent-cards"),
         ("9. identities", f"{SCREENING_IDENTITY} (llm_call * rate 300/h; 9 mcp_tool; skill_exec skill id; a2a_call card depth 2) and "
-                          f"{FRAUD_IDENTITY} (llm_call * rate 300/h); memberships; keys "
+                          f"{FRAUD_IDENTITY} (llm_call * rate 300/h); memberships; implementation (RFC 0023, "
+                          f"PATCH only what differs): {_implementation_plan(SCREENING_DIST)} and "
+                          f"{_implementation_plan(FRAUD_DIST)}; keys "
                           f"{SCREENING_KEY_NAME}, {FRAUD_KEY_NAME}"),
+        ("9b. composition", f"POST /v1/admin/ai-systems/{{demo}}/dependencies: {DEMO_SYSTEM_NAME} -> "
+                            f"{FRAUD_SYSTEM_NAME} (shared_service via {FRAUD_CARD_NAME}, critical, "
+                            "contributes to the decision, follows the active contract, same legal "
+                            "entity: no supplier_legal_entity; the registry evaluates the screener "
+                            "at its effective tier, high)"),
         ("10. portal_user",
          "skipped (--no-portal-user)" if not portal_user else
          f"POST /v1/admin/end-users {PORTAL_UNDERWRITER_USER} ('{PORTAL_UNDERWRITER_DISPLAY}', "

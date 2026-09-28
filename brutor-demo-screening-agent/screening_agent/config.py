@@ -68,6 +68,11 @@ class Settings:
     # How many pending applications a tick lists before excluding held and
     # skipped ones; large so held applications never crowd out the batch.
     list_limit: int = 50
+    # The release's build id (RFC 0023), e.g. the git SHA the image was built
+    # from. Baked into the image by the Dockerfile's BRUTOR_AGENT_BUILD build
+    # arg; empty = no build header. Name and version come from the installed
+    # distribution (identity.py), never from the environment.
+    agent_build: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -91,6 +96,7 @@ class Settings:
             data_dir=Path(_env("DATA_DIR", "/data")),
             health_port=_env_int("HEALTH_PORT", 9201),
             log_level=_env("LOG_LEVEL", "INFO").upper(),
+            agent_build=_env("BRUTOR_AGENT_BUILD").strip(),
         )
 
     def missing(self) -> list[str]:

@@ -22,6 +22,10 @@ class Settings:
     port: int = 9200
     llm_timeout_seconds: float = 20.0
     log_level: str = "INFO"
+    # The release's build id (RFC 0023), e.g. the git SHA the image was built
+    # from; baked in by the Dockerfile's BRUTOR_AGENT_BUILD build arg. Empty =
+    # no build header. Name and version come from the installed distribution.
+    agent_build: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -40,4 +44,5 @@ class Settings:
             port=int(_env("A2A_PORT", "9200")),
             llm_timeout_seconds=float(_env("LLM_TIMEOUT_SECONDS", "20")),
             log_level=_env("LOG_LEVEL", "INFO").upper(),
+            agent_build=_env("BRUTOR_AGENT_BUILD").strip(),
         )
