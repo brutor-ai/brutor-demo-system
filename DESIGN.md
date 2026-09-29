@@ -140,7 +140,12 @@ User Portal (Inbox → Approvals, as a member of the system's resource group; th
 Admin Console page, Compliance → Human Oversight only shows the tiles), the agent
 re-issues the identical call with
 `X-Approval-Token` in a new short run (`apply_approved_decision` step, outcome
-`resolved`). Rejected or expired approvals get a note and are dropped.
+`resolved`). Expired approvals are re-raised (below). A rejected approval is handed off:
+`applications_hand_off` in its own short run (outcome `handed_off`) moves the
+application to `needs_manual_review`, so it is not screened into a fresh hold on the
+next tick. An approved decision that cannot be applied is retried on later ticks; only
+application-class failures (below) count toward its three attempts, so an outage never
+drops a human's approval.
 
 **Terminal states.** `completed` + `resolved` on the normal path. `completed` +
 `escalated` on an approval hold. `errored` if a node raises (the agent closes the run
@@ -150,14 +155,89 @@ A 403 guardrail or policy block ends the run `blocked_policy`. Nothing ever ends
 `exhausted` because the graph has no loop; the README says so.
 
 **Tick loop.** `TICK_SECONDS` (default 600). Each tick: resolve pending approvals,
-list pending applications (`applications_list_pending`, sent as its own one-action run
+retry any hand-off that did not go through, list pending applications
+(`applications_list_pending`, each call sent as its own one-action run
 `bds-tick-<ulid>`, step `poll_pending`, closed on that same call with `completed` /
 `resolved`; an unattributed call would otherwise be minted a root by the gateway and
 swept as an `abandoned` run every tick, which skews the graded completion and
-abandoned rates), process up to `MAX_PER_TICK` (default 5) sequentially. First tick
-runs at start. `python -m screening_agent --once` processes one tick and exits.
+abandoned rates), process up to `MAX_PER_TICK` (default 5) sequentially, oldest first.
+First tick runs at start. `python -m screening_agent --once` processes one tick and exits.
 
-**Approval expiry.** The trial's approval timeout is 300 s (from the 202 body). When
+**No starvation.** Applications held for an underwriter and applications on the skip
+list are excluded from the batch, but they can never fill it: the listing pages with the
+cursor `after` (the last application id of the previous page; `LIST_LIMIT` rows per page,
+the server caps a page at 100, at most `LIST_MAX_PAGES` pages) until it has
+`MAX_PER_TICK` screenable applications or the pending set is exhausted. The first page's
+call is unchanged (`{"limit": N}`); further pages are further one-action tick runs, so
+they only appear when more than a page of held or skipped applications is waiting.
+(Before 2026-09-28 the tick asked for one oldest-first page of
+`max(LIST_LIMIT, MAX_PER_TICK + skipped + held)`; the server caps pages at 100, so 100
+skipped applications starved every new one.)
+
+**Failure classes (2026-09-28).** Every failed run is classified in one place,
+`screening_agent/failures.py`, from the error shapes the gateway client raises:
+
+| Class | Kind | What the agent sees |
+|---|---|---|
+| system | `unreachable` | no HTTP answer: DNS failure, connection refused or reset, timeout |
+| system | `server_error` | HTTP 5xx, e.g. 503 `gateway_resilience_gated`, 502 from the delegate, `skill_error_5xx` |
+| system | `rate_limited` | HTTP 429, e.g. provider `credit_balance_exhausted`, gateway limits and budgets, `run_cap_reached`, `skill_error_429` |
+| system | `approval_hold` | a hold outside the record step: `skill_error_202: approval_required` (autonomy demoted to `approval_required`), an unexpected 202 / 428 |
+| system | `governance_refusal` | `autonomy_denied: ...`, `run_aborted` / "run aborted by an operator", 401, a 403 without a content verdict (missing grant), `skill_error_401/403` |
+| system | `unavailable` | other 4xx about the target: 404, 405, 408, 409, `skill_error_404` |
+| system | `delegate_failed` | the A2A delegate's task ended FAILED / REJECTED / CANCELED |
+| application | `content_blocked` | a content verdict: `guardrail_blocked`, `semantic_policy_blocked`, an argument-policy deny (`argument_policy`, JSON-RPC -32000) |
+| application | `rejected_request` | 400 / 413 / 422, `skill_error_400/413/422` |
+| application | `tool_error` | a tool answered with an error about this application |
+| application | `malformed_output` | an answer without a status the agent could not use (non-JSON model or tool output) |
+| application | `unexpected` | any other exception while processing the application (a malformed record) |
+
+Order: no answer, then governance refusals (an `autonomy_denied` refusal names the
+`approval_required` level it refuses at), then approval holds, then content verdicts (a
+guardrail block is a 403 and still the application's), then the status, then the
+exception family.
+
+- **Application-class** failures count per application (`DATA_DIR/retries.json`). The
+  application stays `received` and is retried next tick; after
+  `MAX_ATTEMPTS_PER_APPLICATION` (3) the agent calls `applications_hand_off` in its own
+  short run `bds-<id>-giveup-<ulid>` (step `give_up`, `completed` / `handed_off`), which
+  sets the terminal status `needs_manual_review` with the reason as a note: the honest
+  business outcome, and the application leaves the pending set. If the hand-off call
+  fails, the application stays on the local skip list and the hand-off is retried at the
+  start of every tick.
+- **System-class** failures never count against an application and never skip it. The
+  tick stops at the first one; the next `2^(streak-1) - 1` ticks are skipped entirely
+  (no gateway calls), capped at `BACKOFF_MAX_TICKS` (6): probes at +10, +20, +40, +80
+  minutes, then every 70 minutes. Any run that completes, or fails on the application's
+  own account, clears the backoff. The application that tripped the backoff is probed
+  last next time, so a failure wrongly classified as the system's cannot keep the rest of
+  the queue waiting. Logged as `SYSTEM failure (system/<kind>) ... backing off N tick(s)`;
+  `/status` shows `backoff` and `system_failures`.
+
+Why: on 2026-09-27/28 the provider ran out of credits (429, then 503 resilience-gated)
+and the resulting drift demoted the system to `approval_required` (every run stopped at
+`skill_error_202`). Each application failed three times on conditions that were not its
+own, 100 landed on the skip list "for good", and because they filled the listing page, no
+new application was screened afterwards.
+
+**Re-queue.** `./demo.sh requeue APP-... [APP-...]` or `./demo.sh requeue --all-skipped`
+clears the agent's skip list (`python -m screening_agent --requeue ... |
+--requeue-all-skipped`; the running scheduler re-reads the file) and moves the
+applications back from `needs_manual_review` to `received` in the origination system
+(`python -m applications_mcp.requeue`, an operator CLI, not an agent tool: the agent can
+hand an application off but never pull one back). An application that was handed off and
+is pending again is released automatically and screened with fresh attempts.
+
+`retries.json` format v2: `{version: 2, attempts, skipped: {id: {reason, failure_kind,
+attempts, at, handed_off, handed_off_at?}}, released: [...]}` (released = the capped
+history of why entries left the skip list). A v1 file is migrated on read: skips whose
+recorded reason is system-class are released (screened again), the rest are kept and
+handed off; v1 attempt counts mixed both classes and are not carried over; the original
+is kept as `retries.v1.json`.
+
+**Approval expiry.** Every hold waits 24 h (`timeout_seconds` in the 202 body): setup sets
+the organisation's approval window to 86,400 s and both AI Systems inherit it (platform
+a193+; older platforms use 300 s). When
 an approval expires the agent notes it and drops the entry; the application stays
 `received`, so the next tick screens it again and raises a fresh approval. The queue
 therefore always holds the current decision until an underwriter acts.
@@ -180,18 +260,22 @@ Tools (bare names as the gateway exposes them):
 
 | Tool | Read-only | Arguments | Returns |
 |---|---|---|---|
-| `applications_list_pending` | yes | `limit` (int, default 10) | `[{application_id, received_at, amount_eur, purpose_short}]` with status `received` |
+| `applications_list_pending` | yes | `limit` (int, default 10, max 100), optional `after` (page cursor: the last `application_id` of the previous page) | `[{application_id, received_at, amount_eur, purpose_short}]` with status `received`, oldest first, after the cursor |
 | `applications_get` | yes | `application_id` | Full record (below) |
 | `applications_set_recommendation` | **no** | `application_id`, `recommendation` (approve/refer/decline), `amount_eur`, `rationale`, `risk_band`, `affordability_class`, `fraud_verdict`, `customer_letter` | `{ok, application_id, status: "screened"}`; 409-style error if already screened |
 | `applications_add_note` | no | `application_id`, `note` | `{ok, notes_count}` |
+| `applications_hand_off` | no (idempotent) | `application_id`, `reason` | sets `needs_manual_review` (no longer pending), keeps the reason as a note; `{ok, status, handed_off_at}` |
 | `applications_stats` | yes | none | counts by status and by recommendation |
 
 Application record: `application_id` (`APP-<yyyymmdd>-<seq>`), `received_at`,
 `applicant {applicant_id, full_name, date_of_birth, country (SE/FI/NO/DK/DE/NL), email,
 employment_status}`, `requested_amount_eur` (2,000 to 60,000), `term_months` (12 to 84),
 `purpose` (free text), `monthly_income_eur`, `monthly_expenses_eur`,
-`existing_debt_monthly_eur`, `status` (received/screened), `recommendation` (nullable),
-`notes []`, `screened_at`.
+`existing_debt_monthly_eur`, `status` (received / screened / needs_manual_review),
+`recommendation` (nullable), `notes []`, `screened_at`, and `handed_off_at` /
+`requeued_at` once handed off / re-queued. `needs_manual_review` refuses
+`applications_set_recommendation` (`in_manual_review`) until an operator re-queues it
+(`python -m applications_mcp.requeue APP-... | --all`).
 
 Generator: a background thread creates 2 to 3 new applications every
 `GENERATE_INTERVAL_SECONDS` (default 600, about 360 a day) and 3 at first start.
@@ -333,8 +417,9 @@ screening_agent/
   identity.py      the agent's implementation identity (RFC 0023): name, installed version, build
   graph.py         LangGraph StateGraph with the eight nodes
   rules.py         deterministic decision rules (pure functions, unit-tested)
-  approvals.py     pending approval store + resolution
-  scheduler.py     tick loop, health server
+  approvals.py     pending approval store + resolution, hand-off to manual review
+  failures.py      failure classification: application vs system (section 4, "Failure classes")
+  scheduler.py     tick loop, retry tracker, backoff, listing pages, health server
   prompts.py       the two prompts (classifier, drafter) incl. the disclosure sentence
 tests/             rules, header builder, graph with a fake gateway
 ```
@@ -346,7 +431,8 @@ Env (all read by `config.py`, provided by `.demo.env`):
 (default `system-agent-skill-server-default`), `FRAUD_CARD_ID`,
 `FRAUD_CAPABILITY` (default `screening.fraud_sanctions`), `CLASSIFIER_MODEL`
 (default `gpt-5.2`), `DRAFTER_MODEL` (default `gpt-5.5`), `TICK_SECONDS` (600),
-`MAX_PER_TICK` (5), `DATA_DIR` (`/data`), `HEALTH_PORT` (9201), `LOG_LEVEL`,
+`MAX_PER_TICK` (5), `LIST_LIMIT` (50, listing page size), `LIST_MAX_PAGES` (20),
+`BACKOFF_MAX_TICKS` (6), `RERAISE_MAX` (0), `DATA_DIR` (`/data`), `HEALTH_PORT` (9201), `LOG_LEVEL`,
 `BRUTOR_AGENT_BUILD` (empty; baked into the image from the Dockerfile's build arg of
 the same name, see section 8 "Agent release"). There is deliberately no variable for
 the agent's name or version: they come from the installed distribution.
@@ -366,8 +452,9 @@ top_p is sent on any LLM call (gpt-5.x and Claude 4.8+ reject them).
 setup.py         idempotent REST provisioning (section 6), writes .demo.env
 verify.py        reads back health, runs, contract, gate, obligations, evidence, Annex IV doc, and (RFC 0023) each identity's declared implementation, the empty client labels and the latest observed release with its trust
 docker-compose.yml  the four containers on the external brutor-network, env_file .demo.env, a named volume for the agent's /data and the applications' /data
-demo.sh          up | provision | start | status | logs | down | run-one | generate
-                 (orchestrates the order below; run-one screens one application, generate adds N)
+demo.sh          up | provision | start | status | logs | down | run-one | generate | requeue
+                 (orchestrates the order below; run-one screens one application, generate adds N,
+                 requeue puts handed-off applications back in the queue)
 .env.example     OPENAI_API_KEY, optional ANTHROPIC_API_KEY, CP_URL, GW_URL, ADMIN_USER/PASSWORD, TENANT_ID, CLASSIFIER_MODEL, DRAFTER_MODEL, EU_STRICT_RESIDENCY
 docs/            fria.md, risk-assessment.md, data-governance.md, evaluation-report.md, instructions-for-use.md (the documents the evidence rows point at, with sha256 stamped by setup.py)
 ```
@@ -534,7 +621,7 @@ at an EU endpoint first.
 | action_type | target | effect | constraints |
 |---|---|---|---|
 | llm_call | `*` | allow | `{"rate": {"max": 300, "window": "hour"}}` |
-| mcp_tool | `applications_list_pending`, `applications_get`, `applications_add_note`, `applications_set_recommendation` | allow | |
+| mcp_tool | `applications_list_pending`, `applications_get`, `applications_add_note`, `applications_set_recommendation`, `applications_hand_off` | allow | `applications_hand_off` since 2026-09-28 (agent 0.2.0) |
 | mcp_tool | `bureau_verify_identity`, `bureau_get_report` | allow | |
 | mcp_tool | `skills__list`, `skills__load`, `skills__run_script` | allow | |
 | skill_exec | the `affordability-check` skill **id** | allow | the skill orchestrator checks this grant separately from the MCP tool grants; without it every run failed with `skill_error_403` on the first live tick |
@@ -553,9 +640,11 @@ Only these constraint keys are parsed by the core: `rate {max, window}`,
 this order: `schema_invalid → deny`, `field_eq recommendation "decline" →
 approval_required`, `field_gt amount_eur 25000 → approval_required`. Bound to the demo
 system. First matching rule wins. The capability filter row for
-`applications_set_recommendation` stays `enabled` but carries
-`approval_timeout_seconds: 86400`, which the core (0.10.95 and later) uses as the
-hold window for band-raised approvals; older cores use 300 s.
+`applications_set_recommendation` stays `enabled` and carries no window of its own: the
+band's hold, like every other hold, takes the organisation's 24-hour approval window
+(a193). A per-tool `approval_timeout_seconds` would override the group's window in both
+directions, so the old per-tool 86,400 was removed rather than kept as a second statement
+of the same rule.
 
 ### 7.3 Guardrails, limits, envelope
 
@@ -741,7 +830,12 @@ identical call with `X-Approval-Token`. One-time token.
 - Screening agent: unit tests for `rules.py`, the header builder (run/turn/step/close
   headers, no `true` run-end, lengths), the approval store, and the graph against a
   fake gateway that records headers per call and asserts every call in a run carries
-  the same run id and the last one carries Run-End.
+  the same run id and the last one carries Run-End. `tests/test_failures.py` drives
+  every failure kind through the real gateway client (including the errors seen live on
+  2026-09-27/28) and fails when a kind has no case or no row in the table;
+  `tests/test_scheduler.py`: system failures never skip and back off on the documented
+  schedule, application failures hand off after three, a full page of held and skipped
+  applications does not starve new ones, re-queueing, v1 tracker migration.
 - Fraud agent: card served, both `message:send` spellings, chain headers echoed,
   sanctions hit → `hit`.
 - Agent release (both agents, `tests/test_identity.py`): the header names and the MCP
@@ -782,7 +876,8 @@ The demo system is **not part of the product build or release scripts** and must
 be added to `DOCKER_REPOS`, `EXTRA_IMAGES`, `EXTRA_TAG_REPOS` or the trial bundle
 compose. It is built from source by `demo.sh up` (`docker compose --build`) and run
 as an add-on against a trial stack. Compatibility is stated, not automated: the
-README names the platform version it was last verified against (0.10.93). If the
+README names the platform version it was last verified against and the minimum it
+requires (both 0.11.6 as of 2026-09-29; the README is the one place to update). If the
 demo ever gets its own GitHub repo and CI, that CI runs the demo's tests and may
 publish images under its own tags, independent of the platform release.
 

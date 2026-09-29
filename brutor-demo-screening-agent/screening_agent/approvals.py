@@ -7,8 +7,9 @@ On every tick resolve_pending() polls each entry:
     approved  -> new run bds-<application_id>-approval-<ulid>, one step
                  apply_approved_decision, the identical tool call with
                  X-Approval-Token, Run-End completed / outcome resolved
-    rejected  -> applications_add_note in its own short run
-                 (Run-End completed / outcome handed_off), entry dropped
+    rejected  -> applications_hand_off in its own short run (Run-End
+                 completed / outcome handed_off): the application leaves the
+                 pending set as needs_manual_review; entry dropped
     expired   -> the hold is RE-RAISED: the identical tool call is re-issued
                  (no token) in run bds-<application_id>-rehold-<ulid>, step
                  reraise_approval, closed Run-End completed / outcome
@@ -17,6 +18,10 @@ On every tick resolve_pending() polls each entry:
                  re-screened while it is held, so the Tool Approvals queue
                  always holds the current decision until a human acts.
     pending   -> kept for the next tick
+
+An approved decision that cannot be applied is retried on later ticks; only
+application-class failures (failures.py) count toward MAX_APPLY_ATTEMPTS, so a
+gateway outage never drops a human's approval.
 """
 
 from __future__ import annotations
@@ -30,12 +35,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import Settings
-from .gateway import ApprovalRequired, Gateway, GatewayError, PolicyBlocked, new_ulid
+from .failures import classify_failure
+from .gateway import ApprovalRequired, Gateway, GatewayError, PolicyBlocked, ToolError, new_ulid
 
 log = logging.getLogger("screening_agent.approvals")
 
 PENDING_FILE = "pending_approvals.json"
 MAX_APPLY_ATTEMPTS = 3
+HAND_OFF_TOOL = "applications_hand_off"
+# Tool answers that mean "this application is no longer pending anyway".
+HAND_OFF_SETTLED_ERRORS = frozenset({"already_screened", "not_found"})
 
 
 def _atomic_write(path: Path, payload: Any) -> None:
@@ -133,6 +142,38 @@ def note_run(
             outcome=outcome,
         )
     log.info("run=%s state=completed outcome=%s application=%s note=%s", run_id, outcome, application_id, note[:80])
+    return run_id
+
+
+def hand_off_run(
+    gw: Gateway,
+    settings: Settings,
+    application_id: str,
+    reason: str,
+    *,
+    suffix: str,
+    step_id: str,
+    step_name: str,
+) -> str:
+    """Hand an application off to manual underwriting: applications_hand_off
+    moves it to the terminal status `needs_manual_review` (so it leaves the
+    pending set) and records the reason as a note, in its own short run closed
+    on that call (outcome handed_off). Returns the run id; raises when the
+    application could not be handed off."""
+    run_id = f"bds-{application_id}-{suffix}-{new_ulid()}"
+    with gw.run(run_id):
+        out = gw.mcp_call(
+            settings.applications_mcp_server_id,
+            HAND_OFF_TOOL,
+            {"application_id": application_id, "reason": reason},
+            step_id=step_id,
+            step_name=step_name,
+            run_end="completed",
+            outcome="handed_off",
+        )
+    if isinstance(out, dict) and out.get("ok") is False and out.get("error") not in HAND_OFF_SETTLED_ERRORS:
+        raise ToolError(f"{HAND_OFF_TOOL}: {out.get('error')}", body=out)
+    log.info("run=%s state=completed outcome=handed_off application=%s status=needs_manual_review", run_id, application_id)
     return run_id
 
 
@@ -234,6 +275,11 @@ def resolve_pending(
                 counts["pending"] += 1
                 continue
             except Exception as exc:
+                failure = classify_failure(exc)
+                if failure.is_system:
+                    log.warning("approval=%s apply failed on a system condition (%s); keeping it for the next tick, not counted: %s", approval_id, failure.label(), exc)
+                    counts["errored"] += 1
+                    continue
                 entry["apply_attempts"] = int(entry.get("apply_attempts", 0)) + 1
                 if entry["apply_attempts"] >= MAX_APPLY_ATTEMPTS:
                     log.error("approval=%s apply failed %d times, dropping: %s", approval_id, entry["apply_attempts"], exc)
@@ -251,7 +297,7 @@ def resolve_pending(
             continue
         if status == "rejected":
             try:
-                _safe_note(
+                _safe_hand_off(
                     gw,
                     settings,
                     application_id,
@@ -272,7 +318,7 @@ def resolve_pending(
         if settings.reraise_max and reraise_count >= settings.reraise_max:
             log.warning("approval=%s expired %d times (RERAISE_MAX=%d); handing off application=%s", approval_id, reraise_count, settings.reraise_max, application_id)
             try:
-                _safe_note(
+                _safe_hand_off(
                     gw,
                     settings,
                     application_id,
@@ -332,3 +378,21 @@ def _safe_note(gw: Gateway, settings: Settings, application_id: str, note: str, 
         )
     except Exception as exc:  # the note is best effort; the entry is dropped either way
         log.error("application=%s could not add note: %s", application_id, exc)
+
+
+def _safe_hand_off(gw: Gateway, settings: Settings, application_id: str, reason: str, *, suffix: str) -> None:
+    """Hand off after an underwriter closed the hold; fall back to a plain note
+    (the pre-hand-off behaviour) when the hand-off itself fails."""
+    try:
+        hand_off_run(
+            gw,
+            settings,
+            application_id,
+            reason,
+            suffix=suffix,
+            step_id="approval_closed",
+            step_name="Approval hold closed",
+        )
+    except Exception as exc:
+        log.error("application=%s could not be handed off (%s); adding a note instead", application_id, exc)
+        _safe_note(gw, settings, application_id, reason, suffix=suffix)

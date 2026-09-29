@@ -124,6 +124,13 @@ GUARDRAIL_NAME = "Brutor Demo Screening Guardrails"
 BASELINE_GUARDRAIL_NAME = "Borealis Baseline Guardrails"
 ARG_POLICY_NAME = "Adverse or large decisions need an underwriter"
 RESPONSE_POLICY_NAME = "Drift downgrades autonomy to approval_required"
+#: How long every approval hold waits for the underwriter (a193): a day, so a
+#: hold raised in the evening survives until the owner approves the next
+#: morning. Set once on the organisation; the AI Systems inherit it (min-wins)
+#: and it applies to EVERY hold that names no window of its own — skill runs,
+#: application notes, the recommendation band and every hold raised while a
+#: drift response has demoted the system to approval_required.
+APPROVAL_WINDOW_SECONDS = 86400
 # The underwriter who decides held calls in the User Portal (Inbox -> Approvals).
 # Approvals are scoped by resource-group membership; an end-user group bound
 # to the demo system is what makes the screening agent's holds visible to her
@@ -438,14 +445,12 @@ def write_demo_env(values: Dict[str, str]) -> None:
 # Provisioner
 # --------------------------------------------------------------------------- #
 def _capability_row(tool: str) -> Dict[str, Any]:
-    """One capability-filter row: every tool enabled; the recommendation tool
-    also carries the hold window used by the argument-policy band (core
-    0.10.95 and later honour approval_timeout_seconds on an enabled row;
-    older cores ignore it and keep the 300 s default)."""
-    row: Dict[str, Any] = {"capability_type": "tool", "capability_name": tool, "access": "enabled"}
-    if tool == "applications_set_recommendation":
-        row["approval_timeout_seconds"] = 86400
-    return row
+    """One capability-filter row: every tool enabled. No per-tool
+    approval_timeout_seconds: every hold takes the organisation's approval
+    window (APPROVAL_WINDOW_SECONDS, a193). A per-tool window would override
+    it in both directions, so the old 86400 on applications_set_recommendation
+    was dropped — one statement of the window, not two that can diverge."""
+    return {"capability_type": "tool", "capability_name": tool, "access": "enabled"}
 
 
 class Provisioner:
@@ -626,6 +631,26 @@ class Provisioner:
             "frequency": {"max_calls_per_hour": 2000},
         }}, tolerate=(400, 422))
         ok("org_unit.limits.mcp", "2000 calls/hour")
+
+        self._approval_window(gid)
+
+    def _approval_window(self, gid: str) -> None:
+        """Every hold waits a day for the underwriter (a193). On the org, so
+        both AI Systems inherit it and neither can lengthen it; a platform
+        older than a193 has no such setting (404) and keeps 300 s."""
+        self.step("org_unit.approval_window")
+        status, resp = self.cp.put(f"/v1/admin/resource-groups/{gid}/approval-window",
+                                   {"approval_window_seconds": APPROVAL_WINDOW_SECONDS},
+                                   tolerate=(404,))
+        if status == 404:
+            warn("org_unit.approval_window",
+                 "platform older than a193: holds without a window of their own expire after 300 s")
+            return
+        effective = resp.get("effective_seconds") if isinstance(resp, dict) else None
+        if effective != APPROVAL_WINDOW_SECONDS:
+            raise StepError("org_unit.approval_window",
+                            f"the control plane did not keep the window: {_short(resp, 200)}")
+        ok("org_unit.approval_window", f"{APPROVAL_WINDOW_SECONDS // 3600} h for every hold (inherited by the AI Systems)")
 
     # -- 4. AI systems ------------------------------------------------------
     def ai_systems(self) -> None:
@@ -849,10 +874,8 @@ class Provisioner:
                  "no tools discovered (is the container up?); capability filter not written, "
                  "the group default access applies")
             return
-        # A per-capability approval_timeout_seconds is honoured even on an
-        # enabled tool (core >= 0.10.95): it sets the window for holds raised
-        # by the argument-policy band on that tool, so an underwriter has a
-        # working day instead of 300 s. Older cores ignore it and keep 300 s.
+        # Every tool enabled; holds (the recommendation band, notes, skill
+        # runs, demotion holds) take the organisation's approval window.
         body = {"capabilities": [_capability_row(t) for t in tools]}
         status, resp = self.cp.put(f"/v1/admin/resource-groups/{gid}/server-configs/{cfg}/capabilities",
                                    body, tolerate=(400, 404))
@@ -1061,7 +1084,8 @@ class Provisioner:
         screening_grants = [("llm_call", "*", "allow", rate)]
         screening_grants += [("mcp_tool", t, "allow", None) for t in (
             "applications_list_pending", "applications_get", "applications_add_note",
-            "applications_set_recommendation", "bureau_verify_identity", "bureau_get_report",
+            "applications_set_recommendation", "applications_hand_off",
+            "bureau_verify_identity", "bureau_get_report",
             "skills__list", "skills__load", "skills__run_script")]
         screening_grants.append(("a2a_call", card_id, "allow", {"max_delegation_depth": 2}))
         # Running a skill is authorized twice: the MCP surface checks the
@@ -1821,7 +1845,9 @@ def dry_run(residency: bool, skip_lifecycle: bool, portal_user: bool = True) -> 
         ("2. models", f"find {CLASSIFIER_MODEL} and {DRAFTER_MODEL} in GET /v1/admin/llms; PATCH api_key; "
                       "import from /v1/admin/llm-catalog if missing"),
         ("3. org_unit", f"POST /v1/admin/resource-groups {ORG_NAME} (organization, '{ORG_DISPLAY}'); bind "
-                        f"{CLASSIFIER_MODEL} to the org; org limits 50/1000 USD, 120 rpm, concurrency 4, 2000 mcp/h"),
+                        f"{CLASSIFIER_MODEL} to the org; org limits 50/1000 USD, 120 rpm, concurrency 4, 2000 mcp/h; "
+                        f"PUT approval-window {APPROVAL_WINDOW_SECONDS} s on the org (every hold waits a day; "
+                        "the AI Systems inherit it)"),
         ("4. ai_systems", f"{DEMO_SYSTEM_NAME} (agent, high, provider_and_deployer, sensitive, autonomous, inherit_resources, "
                           "intended_client_labels [] (its only caller is its own agent, judged on its release); "
                           f"then PATCH run_idle_timeout_seconds=300, a2a chain depth 2) and "
@@ -1836,7 +1862,7 @@ def dry_run(residency: bool, skip_lifecycle: bool, portal_user: bool = True) -> 
                           f"(fallback DESIGN 5.4, version {FALLBACK_FRAUD_CARD['version']} from "
                           f"{FRAUD_DIST}/pyproject.toml); PATCH card_json + version when they differ; "
                           "sign; PUT /resource-groups/{demo}/agent-cards"),
-        ("9. identities", f"{SCREENING_IDENTITY} (llm_call * rate 300/h; 9 mcp_tool; skill_exec skill id; a2a_call card depth 2) and "
+        ("9. identities", f"{SCREENING_IDENTITY} (llm_call * rate 300/h; 10 mcp_tool; skill_exec skill id; a2a_call card depth 2) and "
                           f"{FRAUD_IDENTITY} (llm_call * rate 300/h); memberships; implementation (RFC 0023, "
                           f"PATCH only what differs): {_implementation_plan(SCREENING_DIST)} and "
                           f"{_implementation_plan(FRAUD_DIST)}; keys "

@@ -13,6 +13,11 @@
 #                         process exactly one pending application on the running
 #                         agent (default: the first id from applications_list_pending)
 #   ./demo.sh generate N  add N synthetic applications to the origination mock
+#   ./demo.sh requeue APP-id [APP-id ...] | --all-skipped
+#                         put applications the agent handed off to manual review
+#                         (status needs_manual_review) back in the queue and
+#                         clear them from the agent's skip list; --all-skipped
+#                         re-queues every application on the agent's skip list
 #
 # Any extra arguments after `up` / `provision` are passed to setup.py
 # (for example: ./demo.sh up --residency or --no-portal-user).
@@ -212,6 +217,42 @@ cmd_generate() {
   ok "the next tick (or ./demo.sh run-one) picks them up"
 }
 
+need_running() {
+  docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true \
+    || die "$1 is not running; ./demo.sh up first"
+}
+
+cmd_requeue() {
+  [[ $# -ge 1 ]] || die "usage: ./demo.sh requeue APP-id [APP-id ...] | --all-skipped"
+  need_running brutor-demo-applications-mcp
+  need_running brutor-demo-screening-agent
+  local ids=() out id
+  if [[ "$1" == "--all-skipped" ]]; then
+    [[ $# -eq 1 ]] || die "--all-skipped takes no ids"
+    log "Clearing the agent's skip list"
+    out="$(docker exec brutor-demo-screening-agent python -m screening_agent --requeue-all-skipped)"
+    printf '%s\n' "$out"
+    for id in $(printf '%s\n' "$out" | grep 'released from the skip list' | grep -o 'APP-[0-9]\{8\}-[0-9]\{1,\}'); do
+      ids+=("$id")
+    done
+    if [[ ${#ids[@]} -eq 0 ]]; then
+      ok "nothing was skipped"
+      return 0
+    fi
+  else
+    for id in "$@"; do
+      [[ "$id" =~ ^APP-[0-9]{8}-[0-9]+$ ]] || die "not an application id: $id"
+      ids+=("$id")
+    done
+    log "Clearing the agent's skip list"
+    docker exec brutor-demo-screening-agent python -m screening_agent --requeue "${ids[@]}"
+  fi
+  log "Moving them back to received in the origination system"
+  # Exit 1 means an id was not found; the rest were still re-queued.
+  docker exec brutor-demo-applications-mcp python -m applications_mcp.requeue "${ids[@]}" || true
+  ok "the next tick screens them again (./demo.sh logs screening-agent)"
+}
+
 cmd_down() {
   local args=()
   if [[ "${1:-}" == "--volumes" ]]; then args+=(--volumes); fi
@@ -220,7 +261,7 @@ cmd_down() {
 }
 
 usage() {
-  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -232,6 +273,7 @@ case "${1:-}" in
   down)      shift; cmd_down "$@" ;;
   run-one)   shift; cmd_run_one "${1:-}" ;;
   generate)  shift; cmd_generate "${1:-}" ;;
+  requeue)   shift; cmd_requeue "$@" ;;
   ""|-h|--help|help) usage ;;
   *) usage; die "unknown command: $1" ;;
 esac

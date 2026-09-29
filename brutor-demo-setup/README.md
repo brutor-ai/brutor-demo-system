@@ -10,7 +10,7 @@ Provisioning, orchestration and the compliance documents for the
 setup.py            idempotent REST provisioning (DESIGN section 6); writes .demo.env
 verify.py           reads back health, runs, contract, gate, obligations, evidence, Annex IV
 docker-compose.yml  the four demo containers on the trial's external brutor-network
-demo.sh             up | provision | start | status | logs | down | run-one | generate
+demo.sh             up | provision | start | status | logs | down | run-one | generate | requeue
 .env.example        OPENAI_API_KEY, CP_URL, GW_URL, admin credentials, model names
 requirements.txt    requests (setup.py and verify.py are otherwise standard library)
 docs/               fria.md, risk-assessment.md, data-governance.md, evaluation-report.md,
@@ -84,7 +84,7 @@ an unexpired `impact_assessment` on file.
 |---|---|
 | 1 | Preflight: control plane, gateway, evidence signing key (warns if absent), the three containers |
 | 2 | Models `gpt-5.2` and `gpt-5.5` found by `model_name`; provider key set; catalog import if missing |
-| 3 | Organisation unit `borealis-consumer-finance`: gpt-5.2 bound here; company-wide LLM limits (50 USD/day, 1,000 USD/month, 120 rpm, concurrency 4) and MCP limits (2,000 calls/hour) |
+| 3 | Organisation unit `borealis-consumer-finance`: gpt-5.2 bound here; company-wide LLM limits (50 USD/day, 1,000 USD/month, 120 rpm, concurrency 4) and MCP limits (2,000 calls/hour); approval window 24 h (every hold, inherited by both AI Systems; a193+) |
 | 4 | AI Systems `brutor-demo-system` (agent, high risk, sensitive, autonomous; idle timeout 300 s, delegation depth 2) and `brutor-demo-fraud-screener` (agent, minimal), both with **inherit resources from parent** on |
 | 5 | gpt-5.5 bound directly to the demo system (`portal_visible` false); gpt-5.2 is inherited from the org on both systems, any direct gpt-5.2 binding from an earlier run is removed, and `effective-llm-models` is read back to confirm |
 | 6 | MCP servers `brutor-demo-applications` and `brutor-demo-credit-bureau` with default server configs, tools discovered and enabled; the skills server config bound |
@@ -128,6 +128,8 @@ For a recording that needs exactly one run, or more applications to screen:
 ./demo.sh run-one                # process the first pending application on the running agent
 ./demo.sh run-one APP-20260923-0004   # a specific one
 ./demo.sh generate 5             # add five synthetic applications to the origination mock
+./demo.sh requeue APP-20260927-0042   # put a handed-off application back in the queue
+./demo.sh requeue --all-skipped       # every application the agent gave up on
 ```
 
 `run-one` execs `python -m screening_agent --application <id>` inside
@@ -136,6 +138,14 @@ is the first row of `applications_list_pending`, fetched with a raw JSON-RPC
 call to `http://127.0.0.1:3014/mcp`). `generate N` execs
 `python -m applications_mcp.generate --count N` inside
 `brutor-demo-applications-mcp`; the next tick, or `run-one`, picks them up.
+`requeue` undoes a hand-off: the agent moves an application to the terminal status
+`needs_manual_review` after three failures attributable to the application (or when an
+underwriter rejects its recommendation). It execs `python -m screening_agent --requeue
+...` (or `--requeue-all-skipped`) in the agent container to clear its skip list, then
+`python -m applications_mcp.requeue ...` in the applications container to move the
+applications back to `received`; the next tick screens them with fresh attempts. Outages
+and governance holds never put an application on the skip list (DESIGN.md section 4,
+"Failure classes"), so after an incident there is normally nothing to re-queue.
 
 ## Inheritance
 

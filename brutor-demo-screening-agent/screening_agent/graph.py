@@ -35,6 +35,7 @@ from typing import Any, TypedDict
 
 from .approvals import PendingApprovals
 from .config import Settings
+from .failures import Failure, classify_failure
 from .gateway import ApprovalRequired, Gateway, PolicyBlocked, ToolError, new_ulid
 from .prompts import classifier_messages, drafter_messages, ensure_disclosure
 from .rules import allowed_recommendations, final_recommendation, normalize_recommendation, policy_floor
@@ -98,6 +99,9 @@ class RunResult:
     error: str | None = None
     approval_id: str | None = None
     duration_ms: int = 0
+    # Whose failure this was (failures.py): the application's, or the system's
+    # (gateway, provider, governance). None when the run completed.
+    failure: Failure | None = None
 
 
 def _require_dict(value: Any, what: str) -> dict[str, Any]:
@@ -352,20 +356,28 @@ def process_application(
                 gw.end_run("completed", outcome)
         except PolicyBlocked as exc:
             gw.end_run("blocked_policy", None)
-            result = RunResult(application_id, run_id, "blocked_policy", None, error=str(exc)[:500])
+            result = RunResult(application_id, run_id, "blocked_policy", None, error=str(exc)[:500], failure=classify_failure(exc))
         except Exception as exc:  # noqa: BLE001 - any node failure ends the run errored
             gw.end_run("errored", None)
-            result = RunResult(application_id, run_id, "errored", None, error=f"{type(exc).__name__}: {str(exc)[:500]}")
+            result = RunResult(
+                application_id,
+                run_id,
+                "errored",
+                None,
+                error=f"{type(exc).__name__}: {str(exc)[:500]}",
+                failure=classify_failure(exc),
+            )
         result.duration_ms = int((time.monotonic() - started) * 1000)
     level = logging.INFO if result.state == "completed" else logging.ERROR
     log.log(
         level,
-        "run=%s state=%s outcome=%s application=%s ms=%d%s",
+        "run=%s state=%s outcome=%s application=%s ms=%d%s%s",
         run_id,
         result.state,
         result.outcome or "-",
         application_id,
         result.duration_ms,
+        f" failure={result.failure.label()}" if result.failure else "",
         f" error={result.error}" if result.error else "",
     )
     return result

@@ -73,13 +73,16 @@ def test_approved_applies_and_rejected_drops(settings, fake, tmp_path):
     assert h["x-brutor-run-end"] == "completed" and h["x-brutor-run-outcome"] == "resolved"
     assert h["x-approval-token"] == "tok-abc"
 
-    # rejected -> note in a short run, handed_off, dropped
-    note_calls = [c for c in fake.calls if c.tool == "applications_add_note"]
-    assert len(note_calls) == 1
-    assert note_calls[0].headers["x-brutor-run-end"] == "completed"
-    assert note_calls[0].headers["x-brutor-run-outcome"] == "handed_off"
-    assert note_calls[0].headers["x-brutor-run-id"].startswith("bds-APP-20260923-002-approval-")
-    assert "rejected" in fake.notes[0]["note"]
+    # rejected -> hand-off in a short run (needs_manual_review, so it is never
+    # re-screened into a fresh hold), handed_off, dropped
+    hand_offs = [c for c in fake.calls if c.tool == "applications_hand_off"]
+    assert len(hand_offs) == 1
+    assert hand_offs[0].headers["x-brutor-run-end"] == "completed"
+    assert hand_offs[0].headers["x-brutor-run-outcome"] == "handed_off"
+    assert hand_offs[0].headers["x-brutor-run-id"].startswith("bds-APP-20260923-002-approval-")
+    assert "rejected" in fake.handed_off[0]["reason"]
+    assert fake.status_of("APP-20260923-002") == "needs_manual_review"
+    assert fake.notes == []
     assert gw.ctx is None
 
 
@@ -155,9 +158,51 @@ def test_reraise_max_hands_off(settings, fake, tmp_path):
     counts = resolve_pending(gw, settings, store)
     assert counts["handed_off"] == 1 and counts["reraised"] == 0
     assert store.all() == []
-    assert len(fake.notes) == 1 and "expired 2 times" in fake.notes[0]["note"]
-    note_call = [c for c in fake.calls if c.tool == "applications_add_note"][0]
-    assert note_call.headers["x-brutor-run-outcome"] == "handed_off"
+    assert len(fake.handed_off) == 1 and "expired 2 times" in fake.handed_off[0]["reason"]
+    hand_off = [c for c in fake.calls if c.tool == "applications_hand_off"][0]
+    assert hand_off.headers["x-brutor-run-outcome"] == "handed_off"
+
+
+def test_rejected_falls_back_to_a_note_when_hand_off_fails(settings, fake, tmp_path):
+    """An applications MCP without applications_hand_off (or a refused call):
+    the pre-hand-off behaviour, a note, still records what happened."""
+    import httpx
+
+    store = PendingApprovals(tmp_path)
+    store.add("APP-20260923-001", "apr-rejected", ARGS, "bds-a")
+    fake.approval_statuses = {"apr-rejected": {"status": "rejected"}}
+    fake.intercept = lambda tool, args, call: (
+        httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "Unknown tool: applications_hand_off"}], "isError": True}})
+        if tool == "applications_hand_off" else None
+    )
+    gw = fake.gateway(settings)
+    counts = resolve_pending(gw, settings, store)
+    assert counts["rejected"] == 1 and store.all() == []
+    assert len(fake.notes) == 1 and "rejected" in fake.notes[0]["note"]
+
+
+def test_approved_apply_is_not_dropped_by_a_system_outage(settings, fake, tmp_path):
+    """A human approval survives any number of system-class apply failures;
+    only application-class failures count toward MAX_APPLY_ATTEMPTS."""
+    import httpx
+
+    from screening_agent.approvals import MAX_APPLY_ATTEMPTS
+
+    store = PendingApprovals(tmp_path)
+    store.add("APP-20260923-001", "apr-approved", ARGS, "bds-a")
+    fake.approval_statuses = {"apr-approved": {"status": "approved", "approval_token": "tok-abc"}}
+    fake.intercept = lambda tool, args, call: (
+        httpx.Response(503, json={"error": {"message": "primary gated by resilience layer", "type": "gateway_resilience_gated"}})
+        if tool == "applications_set_recommendation" else None
+    )
+    gw = fake.gateway(settings)
+    for _ in range(MAX_APPLY_ATTEMPTS + 2):
+        assert resolve_pending(gw, settings, store)["errored"] == 1
+    [entry] = store.all()
+    assert entry["approval_id"] == "apr-approved" and entry["apply_attempts"] == 0
+    fake.intercept = None
+    assert resolve_pending(gw, settings, store)["approved"] == 1
+    assert store.all() == [] and fake.recorded[0]["token"] == "tok-abc"
 
 
 def test_reraise_failure_keeps_entry(settings, fake, tmp_path):

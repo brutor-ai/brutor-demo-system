@@ -65,9 +65,19 @@ class Settings:
     # application is handed off with a note. 0 = unlimited (the queue always
     # holds the current decision until a human acts).
     reraise_max: int = 0
-    # How many pending applications a tick lists before excluding held and
-    # skipped ones; large so held applications never crowd out the batch.
+    # Page size of applications_list_pending (the server caps it at 100). A
+    # tick pages on (cursor `after`) past held and skipped applications until
+    # it has MAX_PER_TICK screenable ones or the pending set is exhausted, so
+    # no number of held or skipped applications can starve new ones.
     list_limit: int = 50
+    # Upper bound on listing pages per tick (a safety stop, not a window: at
+    # the default 50 x 20 a tick looks past up to 1,000 held/skipped ones).
+    list_max_pages: int = 20
+    # Backoff after a SYSTEM-class failure (failures.py): the tick stops, and
+    # the next 2^(streak-1) - 1 ticks are skipped, capped at this many. With
+    # the default 10-minute tick the probe interval grows 10, 20, 40, 80 min,
+    # then stays at 70 min (1 + 6 skipped ticks) until the system answers.
+    backoff_max_ticks: int = 6
     # The release's build id (RFC 0023), e.g. the git SHA the image was built
     # from. Baked into the image by the Dockerfile's BRUTOR_AGENT_BUILD build
     # arg; empty = no build header. Name and version come from the installed
@@ -93,6 +103,8 @@ class Settings:
             max_per_tick=_env_int("MAX_PER_TICK", 5),
             reraise_max=_env_int("RERAISE_MAX", 0),
             list_limit=_env_int("LIST_LIMIT", 50),
+            list_max_pages=_env_int("LIST_MAX_PAGES", 20),
+            backoff_max_ticks=_env_int("BACKOFF_MAX_TICKS", 6),
             data_dir=Path(_env("DATA_DIR", "/data")),
             health_port=_env_int("HEALTH_PORT", 9201),
             log_level=_env("LOG_LEVEL", "INFO").upper(),

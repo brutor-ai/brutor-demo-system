@@ -1,6 +1,8 @@
 import asyncio
 import json
 
+import pytest
+
 from starlette.testclient import TestClient
 
 from applications_mcp import server
@@ -82,7 +84,7 @@ def test_add_note_and_stats(store):
     )
     stats = server.applications_stats()
     assert stats["total"] == 2
-    assert stats["by_status"] == {"received": 1, "screened": 1}
+    assert stats["by_status"] == {"received": 1, "screened": 1, "needs_manual_review": 0}
     assert stats["by_recommendation"] == {"approve": 0, "refer": 0, "decline": 1}
     assert stats["generated_total"] == 2
 
@@ -91,12 +93,16 @@ def test_tool_annotations_mark_reads_as_read_only(store):
     tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
     assert set(tools) == {
         "applications_list_pending", "applications_get", "applications_set_recommendation",
-        "applications_add_note", "applications_stats",
+        "applications_add_note", "applications_stats", "applications_hand_off",
     }
     for name in ("applications_list_pending", "applications_get", "applications_stats"):
         assert tools[name].annotations.readOnlyHint is True, name
-    for name in ("applications_set_recommendation", "applications_add_note"):
+    for name in ("applications_set_recommendation", "applications_add_note", "applications_hand_off"):
         assert tools[name].annotations.readOnlyHint is False, name
+    assert tools["applications_hand_off"].annotations.idempotentHint is True
+    assert set(tools["applications_hand_off"].inputSchema["required"]) == {"application_id", "reason"}
+    # the cursor is optional: a first-page call is unchanged
+    assert tools["applications_list_pending"].inputSchema.get("required", []) == []
     schema = tools["applications_set_recommendation"].inputSchema
     assert "amount_eur" in schema["required"]
     assert "recommendation" in schema["required"]
@@ -150,3 +156,79 @@ def test_raw_jsonrpc_tools_call_without_initialize(store):
                   "params": {"name": "applications_stats", "arguments": {}}},
         )
         assert json.loads(stats.json()["result"]["content"][0]["text"])["total"] == 2
+
+
+def test_list_pending_pages_with_the_after_cursor(store):
+    created = _seed(store, 7)
+    ids = [a["application_id"] for a in server.list_pending(limit=100)]
+    assert len(ids) == 7
+    first = server.list_pending(limit=3)
+    second = server.list_pending(limit=3, after=first[-1]["application_id"])
+    third = server.list_pending(limit=3, after=second[-1]["application_id"])
+    assert [r["application_id"] for r in first + second + third] == ids
+    assert server.list_pending(limit=3, after=ids[-1]) == []
+    # the cursor application need not be pending any more
+    server.applications_hand_off(ids[2], "gave up")
+    assert [r["application_id"] for r in server.list_pending(limit=100, after=ids[2])] == ids[3:]
+    # an unknown cursor means "from the start"; the tool form takes it too
+    assert server.list_pending(limit=2, after="APP-19700101-0001") == server.list_pending(limit=2)
+    assert json.loads(server.applications_list_pending(limit=2, after=ids[0])) == server.list_pending(limit=2, after=ids[0])
+    assert len(created) == 7
+
+
+def test_hand_off_leaves_the_pending_set(store):
+    created = _seed(store, 3)
+    app_id = created[0]["application_id"]
+    out = server.applications_hand_off(app_id, "Automated pre-screening gave up after 3 attempts")
+    assert out["ok"] is True and out["status"] == "needs_manual_review" and out["handed_off_at"]
+    record = server.applications_get(app_id)
+    assert record["status"] == "needs_manual_review"
+    assert record["notes"][-1]["note"].startswith("Automated pre-screening gave up")
+    assert app_id not in [r["application_id"] for r in server.list_pending(limit=100)]
+    # idempotent, and no second note
+    again = server.applications_hand_off(app_id, "again")
+    assert again == {"ok": True, "application_id": app_id, "status": "needs_manual_review", "already": True}
+    assert len(server.applications_get(app_id)["notes"]) == 1
+    # a handed-off application takes no recommendation until re-queued
+    refused = server.applications_set_recommendation(
+        application_id=app_id, recommendation="approve", amount_eur=1, rationale="r",
+        risk_band="low", affordability_class="comfortable", fraud_verdict="clear", customer_letter=LETTER,
+    )
+    assert refused["ok"] is False and refused["error"] == "in_manual_review"
+    assert server.applications_stats()["by_status"] == {"received": 2, "screened": 0, "needs_manual_review": 1}
+    # screened and unknown applications are refused; an empty reason too
+    screened = created[1]["application_id"]
+    server.applications_set_recommendation(
+        application_id=screened, recommendation="approve", amount_eur=1, rationale="r",
+        risk_band="low", affordability_class="comfortable", fraud_verdict="clear", customer_letter=LETTER,
+    )
+    assert server.applications_hand_off(screened, "x")["error"] == "already_screened"
+    assert server.applications_hand_off("APP-19700101-0001", "x")["error"] == "not_found"
+    assert server.applications_hand_off(created[2]["application_id"], "  ")["error"] == "empty_reason"
+
+
+def test_requeue_moves_manual_review_back_to_received(store, capsys):
+    from applications_mcp import requeue
+
+    created = _seed(store, 4)
+    ids = [a["application_id"] for a in created]
+    for app_id in ids[:3]:
+        server.applications_hand_off(app_id, "gave up")
+    server.applications_set_recommendation(
+        application_id=ids[3], recommendation="approve", amount_eur=1, rationale="r",
+        risk_band="low", affordability_class="comfortable", fraud_verdict="clear", customer_letter=LETTER,
+    )
+    out = requeue.requeue(store, [ids[0], ids[3], "APP-19700101-0001"])
+    assert out == {"requeued": [ids[0]], "not_found": ["APP-19700101-0001"], "not_in_manual_review": {ids[3]: "screened"}}
+    record = server.applications_get(ids[0])
+    assert record["status"] == "received" and record["requeued_at"]
+    assert record["notes"][-1]["note"] == requeue.NOTE
+    assert [r["application_id"] for r in server.list_pending(limit=100)] == [ids[0]]
+
+    # the CLI, against the same data dir, re-queues the rest
+    assert requeue.main(["--all", "--data-dir", str(store.data_dir)]) == 0
+    assert f"{ids[1]}: needs_manual_review -> received" in capsys.readouterr().out
+    assert [r["application_id"] for r in server.list_pending(limit=100)] == ids[:3]
+    assert requeue.main(["--data-dir", str(store.data_dir), "APP-19700101-0001"]) == 1
+    with pytest.raises(SystemExit):
+        requeue.main(["--data-dir", str(store.data_dir)])

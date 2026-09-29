@@ -17,7 +17,7 @@ echo "$LIST" | python3 -c '
 import json,sys
 body=json.load(sys.stdin)
 tools={t["name"]:t for t in body["result"]["tools"]}
-expected={"applications_list_pending","applications_get","applications_set_recommendation","applications_add_note","applications_stats"}
+expected={"applications_list_pending","applications_get","applications_set_recommendation","applications_add_note","applications_stats","applications_hand_off"}
 missing=expected-set(tools)
 assert not missing, f"missing tools: {missing}"
 for n,t in sorted(tools.items()):

@@ -30,10 +30,11 @@ Bare names, exactly as the gateway exposes them.
 
 | Tool | Read-only | Arguments | Returns |
 |---|---|---|---|
-| `applications_list_pending` | yes | `limit` (int, default 10, max 100) | `[{application_id, received_at, amount_eur, purpose_short}]`, status `received`, oldest first |
+| `applications_list_pending` | yes | `limit` (int, default 10, max 100), optional `after` (page cursor: the last `application_id` of the previous page) | `[{application_id, received_at, amount_eur, purpose_short}]`, status `received`, oldest first (by `received_at`, then id), only those after the cursor |
 | `applications_get` | yes | `application_id` | The full record (below), or `{ok: false, error: "not_found"}` |
-| `applications_set_recommendation` | **no** | `application_id`, `recommendation` (approve, refer, decline), `amount_eur`, `rationale`, `risk_band`, `affordability_class`, `fraud_verdict`, `customer_letter` | `{ok: true, application_id, status: "screened", recommendation, screened_at}`; `{ok: false, error: "already_screened"}` on a second call; `{ok: false, error: "invalid_recommendation"}` for anything but the three values |
+| `applications_set_recommendation` | **no** | `application_id`, `recommendation` (approve, refer, decline), `amount_eur`, `rationale`, `risk_band`, `affordability_class`, `fraud_verdict`, `customer_letter` | `{ok: true, application_id, status: "screened", recommendation, screened_at}`; `{ok: false, error: "already_screened"}` on a second call; `{ok: false, error: "invalid_recommendation"}` for anything but the three values; `{ok: false, error: "in_manual_review"}` once handed off |
 | `applications_add_note` | no | `application_id`, `note` | `{ok: true, application_id, notes_count}` |
+| `applications_hand_off` | no (idempotent) | `application_id`, `reason` | Moves a `received` application to `needs_manual_review` (no longer pending) and keeps the reason as a note: `{ok: true, application_id, status: "needs_manual_review", handed_off_at}`; again on a handed-off one: `{ok: true, ..., already: true}`; `already_screened`, `not_found`, `empty_reason` otherwise |
 | `applications_stats` | yes | none | `{total, by_status, by_recommendation, generated_total, as_of}` |
 
 Errors are returned as ordinary results with `ok: false` (never as JSON-RPC errors), so
@@ -56,7 +57,7 @@ therefore passes `amount_eur` explicitly, and the server records it under
 ### Read-only annotations
 
 `applications_list_pending`, `applications_get` and `applications_stats` carry
-`readOnlyHint: true`; the two writers carry `readOnlyHint: false`. The gateway uses the
+`readOnlyHint: true`; the three writers carry `readOnlyHint: false`. The gateway uses the
 annotation to decide which calls are **sensitive reads** on a system flagged
 `sensitive_data`, and seals those as evidence. Without the hint the Evidence Ledger would
 not distinguish a read of an applicant's personal data from a write, so the annotations
@@ -92,6 +93,22 @@ are part of the contract.
 After `applications_set_recommendation` the record gains `status: "screened"`,
 `recommendation`, `screened_at` and a `screening` object with the rationale, bands,
 verdict, `amount_eur` and the customer letter. Notes are `{at, note}` entries.
+
+Statuses: `received` (pending screening), `screened` (a recommendation is recorded) and
+`needs_manual_review` (the screening agent handed it off with `applications_hand_off`:
+three failures attributable to the application, or an underwriter rejected the automated
+recommendation; the record gains `handed_off_at`). Manual review is terminal for the
+agent. An operator puts applications back in the queue (status `received`, a note, and
+`requeued_at`):
+
+```bash
+python -m applications_mcp.requeue APP-20260927-0042 [APP-...]   # host, uses DATA_DIR or ./data
+docker exec brutor-demo-applications-mcp python -m applications_mcp.requeue --all
+```
+
+`./demo.sh requeue` in `brutor-demo-setup` does this and clears the agent's skip list.
+Re-queueing is an operator action, not a tool: the agent can hand an application off
+but never pull one back.
 
 ## The generator
 
@@ -223,7 +240,7 @@ is loopback only.
 ## Smoke test
 
 `./smoke.sh [base_url]` (default `http://127.0.0.1:3014`) hits `/health`, posts a raw
-`tools/list` and checks all five tools and their `readOnlyHint` values, then posts
+`tools/list` and checks all six tools and their `readOnlyHint` values, then posts
 `tools/call` for `applications_stats` and `applications_list_pending` and parses
 `result.content[0].text` as JSON. Headers used are the same ones the gateway sends:
 `Content-Type: application/json` and `Accept: application/json, text/event-stream`.
@@ -240,5 +257,6 @@ src/applications_mcp/
   generator.py                deterministic synthetic applications + background thread
   sanctions.py                shared mock sanctions list (kept identical in the fraud screener)
   generate.py                 CLI: python -m applications_mcp.generate --count N
+  requeue.py                  CLI: python -m applications_mcp.requeue APP-... | --all
 tests/                        pytest, in-process, no network
 ```

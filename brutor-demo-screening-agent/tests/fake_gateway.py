@@ -113,6 +113,20 @@ class FakeGateway:
     fail_a2a: bool = False
     approval_statuses: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_list: list[dict[str, Any]] | None = None
+    # More origination records besides `application` (see add_application).
+    applications: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Status overrides by application id (hand-off, recorded recommendation).
+    statuses: dict[str, str] = field(default_factory=dict)
+    # Hook run before every MCP tool: (tool, args, call) -> a canned response
+    # (any failure shape) or None to answer normally.
+    intercept: Callable[[str, dict[str, Any], "Call"], httpx.Response | None] | None = None
+    # Canned answer for every LLM call (chat and responses), e.g. a 429.
+    llm_failure: Callable[[], httpx.Response] | None = None
+    # False = an applications MCP older than 0.2.0 that ignores `after`.
+    supports_cursor: bool = True
+    # True = the gateway is gone (every request fails like a DNS lookup would).
+    down: bool = False
+    handed_off: list[dict[str, Any]] = field(default_factory=list)
     derived_root: str = "root-derived-0001"
     responses_only_models: set[str] = field(default_factory=set)  # chat answers 400 for these
     calls: list[Call] = field(default_factory=list)
@@ -138,6 +152,30 @@ class FakeGateway:
     def calls_of(self, kind: str) -> list[Call]:
         return [c for c in self.calls if c.kind == kind]
 
+    def add_application(self, application_id: str, received_at: str) -> dict[str, Any]:
+        record = json.loads(json.dumps(SAMPLE_APPLICATION))
+        record.update({"application_id": application_id, "received_at": received_at})
+        self.applications[application_id] = record
+        return record
+
+    def record(self, application_id: str | None) -> dict[str, Any] | None:
+        if application_id == self.application["application_id"]:
+            return self.application
+        return self.applications.get(str(application_id))
+
+    def status_of(self, application_id: str) -> str:
+        if application_id in self.statuses:
+            return self.statuses[application_id]
+        record = self.record(application_id)
+        return str(record.get("status") or "received") if record else "received"
+
+    def pending_ids(self) -> list[str]:
+        rows = self.pending_list
+        if rows is None:
+            records = [self.application, *self.applications.values()]
+            rows = sorted(records, key=lambda r: (r["received_at"], r["application_id"]))
+        return [str(r["application_id"]) for r in rows if self.status_of(str(r["application_id"])) == "received"]
+
     # -- handler ---------------------------------------------------------------
     def handler(self, request: httpx.Request) -> httpx.Response:
         raw = request.content
@@ -147,6 +185,8 @@ class FakeGateway:
             body = raw.decode("utf-8", "replace")
         call = Call(request.method, request.url.path, {k.lower(): v for k, v in request.headers.items()}, body)
         self.calls.append(call)
+        if self.down:  # recorded (an attempt was made), never answered
+            raise httpx.ConnectError("[Errno -2] Name or service not known", request=request)
         assert call.headers.get("authorization", "").startswith("Bearer sk_brutor_api_"), "missing Brutor bearer key"
         assert call.headers.get("x-brutor-run-end", "").lower() != "true", "X-Brutor-Run-End: true is banned"
         # RFC 0023: the agent names its implementation and release on every call.
@@ -190,6 +230,8 @@ class FakeGateway:
 
     def _llm(self, body: dict[str, Any]) -> httpx.Response:
         assert "temperature" not in body and "top_p" not in body, "sampling params must not be sent"
+        if self.llm_failure:
+            return self.llm_failure()
         assert body.get("response_format") == {"type": "json_object"}
         if body["model"] in self.responses_only_models:
             return httpx.Response(
@@ -216,6 +258,8 @@ class FakeGateway:
         fields passed through. Answers the OpenAI Responses object shape."""
         assert "temperature" not in body and "top_p" not in body, "sampling params must not be sent"
         assert "messages" not in body and "response_format" not in body, "chat fields on the responses route"
+        if self.llm_failure:
+            return self.llm_failure()
         assert body.get("text") == {"format": {"type": "json_object"}}
         items = body["input"]
         assert isinstance(items, list) and items[0]["role"] == "system"
@@ -250,19 +294,36 @@ class FakeGateway:
         assert client_info.get("name") == DISTRIBUTION and client_info.get("version"), "MCP call without clientInfo"
         tool = body["params"]["name"]
         args = body["params"].get("arguments") or {}
+        if self.intercept:
+            canned = self.intercept(tool, args, call)
+            if canned is not None:
+                return canned
         if tool == self.block_tool:
             return httpx.Response(403, json={"error": "guardrail_blocked", "guardrail": "prompt_injection", "surface": "mcp_output", "message": "Blocked by guardrail"})
         if tool == self.fail_tool:
             return httpx.Response(500, json={"error": "upstream failure"})
         if tool == "applications_list_pending":
-            rows = self.pending_list
-            if rows is None:
-                rows = [{"application_id": self.application["application_id"], "received_at": "2026-09-23T08:00:00Z", "amount_eur": self.application["requested_amount_eur"], "purpose_short": "Kitchen"}]
-            return self._rpc(rows[: int(args.get("limit", 10))])
+            ids = self.pending_ids()
+            after = args.get("after")
+            if after and self.supports_cursor:
+                ids = ids[ids.index(after) + 1:] if after in ids else ids
+            rows = []
+            for app_id in ids[: min(int(args.get("limit", 10)), 100)]:
+                record = self.record(app_id) or {}
+                rows.append({"application_id": app_id, "received_at": record.get("received_at", "2026-09-23T08:00:00Z"), "amount_eur": record.get("requested_amount_eur", 1000), "purpose_short": "Kitchen"})
+            return self._rpc(rows)
         if tool == "applications_get":
-            if args.get("application_id") != self.application["application_id"]:
+            record = self.record(args.get("application_id"))
+            if record is None:
                 return self._rpc(f"unknown application {args.get('application_id')}", is_error=True)
-            return self._rpc(self.application)
+            return self._rpc(record)
+        if tool == "applications_hand_off":
+            app_id = str(args.get("application_id"))
+            if self.status_of(app_id) == "screened":
+                return self._rpc({"ok": False, "error": "already_screened", "application_id": app_id})
+            self.statuses[app_id] = "needs_manual_review"
+            self.handed_off.append(args)
+            return self._rpc({"ok": True, "application_id": app_id, "status": "needs_manual_review"})
         if tool == "applications_set_recommendation":
             if self.approval_rule and self.approval_rule(args) and not call.headers.get("x-approval-token"):
                 self.approval_counter += 1
@@ -280,6 +341,7 @@ class FakeGateway:
                     },
                 )
             self.recorded.append({"args": args, "token": call.headers.get("x-approval-token")})
+            self.statuses[str(args.get("application_id"))] = "screened"
             return self._rpc({"ok": True, "application_id": args.get("application_id"), "status": "screened"})
         if tool == "applications_add_note":
             self.notes.append(args)

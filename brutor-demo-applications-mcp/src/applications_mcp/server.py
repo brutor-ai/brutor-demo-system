@@ -33,7 +33,12 @@ PORT = int(os.environ.get("MCP_PORT", "3014"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 VALID_RECOMMENDATIONS = ("approve", "refer", "decline")
-STATUSES = ("received", "screened")
+# received: pending screening. screened: a recommendation is recorded.
+# needs_manual_review: automated screening handed it off (terminal for the
+# agent; an operator re-queues it with `python -m applications_mcp.requeue`).
+STATUSES = ("received", "screened", "needs_manual_review")
+MANUAL_REVIEW = "needs_manual_review"
+MAX_LIST_LIMIT = 100
 
 log = logging.getLogger("applications_mcp")
 
@@ -41,7 +46,8 @@ mcp = FastMCP(
     name=SERVICE_NAME,
     instructions=(
         "Mock loan origination system of Borealis Consumer Finance AB (synthetic data). "
-        "List pending applications, read one, record a screening recommendation, add notes."
+        "List pending applications, read one, record a screening recommendation, add notes, "
+        "hand an application off to manual review."
     ),
     host=HOST,
     port=PORT,
@@ -53,6 +59,7 @@ mcp = FastMCP(
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
+WRITE_IDEMPOTENT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
 
 _store: Store | None = None
 _generator: Generator | None = None
@@ -83,11 +90,25 @@ def _not_found(application_id: str) -> dict[str, Any]:
 # ---- tools ---------------------------------------------------------------------------
 
 
-def list_pending(limit: int = 10) -> list[dict[str, Any]]:
-    """Pending applications (status `received`), oldest first, as Python objects."""
-    limit = max(1, min(int(limit), 100))
-    pending = [a for a in get_store().all_applications() if a["status"] == "received"]
-    pending.sort(key=lambda a: (a["received_at"], a["application_id"]))
+def _order_key(record: dict[str, Any]) -> tuple[str, str]:
+    return (record["received_at"], record["application_id"])
+
+
+def list_pending(limit: int = 10, after: str | None = None) -> list[dict[str, Any]]:
+    """Pending applications (status `received`), oldest first, as Python objects.
+
+    `after` is a cursor: the application id of the last row of the previous
+    page. Only applications ordered after it (by received_at, then id) are
+    returned. The cursor application need not be pending any more; an unknown
+    id is treated as "from the start"."""
+    limit = max(1, min(int(limit), MAX_LIST_LIMIT))
+    applications = get_store().all_applications()
+    pending = sorted((a for a in applications if a["status"] == "received"), key=_order_key)
+    if after:
+        cursor = next((a for a in applications if a["application_id"] == after), None)
+        if cursor is not None:
+            key = _order_key(cursor)
+            pending = [a for a in pending if _order_key(a) > key]
     return [
         {
             "application_id": a["application_id"],
@@ -100,7 +121,7 @@ def list_pending(limit: int = 10) -> list[dict[str, Any]]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-def applications_list_pending(limit: int = 10) -> str:
+def applications_list_pending(limit: int = 10, after: str | None = None) -> str:
     """List applications that have not been screened yet (status `received`), oldest first.
 
     Returns a JSON array `[{application_id, received_at, amount_eur, purpose_short}]` as
@@ -110,8 +131,10 @@ def applications_list_pending(limit: int = 10) -> str:
 
     Args:
         limit: maximum number of applications to return (1 to 100, default 10).
+        after: page cursor, the `application_id` of the last row of the previous page;
+            returns the pending applications after it. Omit for the first page.
     """
-    return json.dumps(list_pending(limit))
+    return json.dumps(list_pending(limit, after))
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -140,7 +163,8 @@ def applications_set_recommendation(
 ) -> dict[str, Any]:
     """Record the screening recommendation and mark the application as screened.
 
-    Fails with `already_screened` if a recommendation was recorded before, and with
+    Fails with `already_screened` if a recommendation was recorded before, with
+    `in_manual_review` once the application was handed off to manual review, and with
     `invalid_recommendation` unless `recommendation` is approve, refer or decline.
 
     Args:
@@ -169,6 +193,13 @@ def applications_set_recommendation(
         record = state["applications"].get(application_id)
         if record is None:
             return _not_found(application_id)
+        if record["status"] == MANUAL_REVIEW:
+            return {
+                "ok": False,
+                "error": "in_manual_review",
+                "application_id": application_id,
+                "status": MANUAL_REVIEW,
+            }
         if record["status"] == "screened":
             return {
                 "ok": False,
@@ -198,6 +229,40 @@ def applications_set_recommendation(
             "recommendation": recommendation,
             "screened_at": screened_at,
         }
+
+    return get_store().mutate(_apply)
+
+
+@mcp.tool(annotations=WRITE_IDEMPOTENT)
+def applications_hand_off(application_id: str, reason: str) -> dict[str, Any]:
+    """Hand a pending application off to manual underwriting.
+
+    Sets the status to `needs_manual_review` (it is no longer listed as pending) and
+    records the reason as a note. Only a `received` application can be handed off;
+    handing off one that is already in manual review is a no-op that returns ok.
+    Fails with `already_screened` once a recommendation is recorded.
+
+    Args:
+        application_id: the application to hand off.
+        reason: why automated screening handed it off (kept as a note).
+    """
+    reason = str(reason).strip()
+    if not reason:
+        return {"ok": False, "error": "empty_reason", "application_id": application_id}
+
+    def _apply(state: dict[str, Any]) -> dict[str, Any]:
+        record = state["applications"].get(application_id)
+        if record is None:
+            return _not_found(application_id)
+        if record["status"] == "screened":
+            return {"ok": False, "error": "already_screened", "application_id": application_id, "status": "screened"}
+        if record["status"] == MANUAL_REVIEW:
+            return {"ok": True, "application_id": application_id, "status": MANUAL_REVIEW, "already": True}
+        now = _now_iso()
+        record["status"] = MANUAL_REVIEW
+        record["handed_off_at"] = now
+        record.setdefault("notes", []).append({"at": now, "note": reason})
+        return {"ok": True, "application_id": application_id, "status": MANUAL_REVIEW, "handed_off_at": now}
 
     return get_store().mutate(_apply)
 

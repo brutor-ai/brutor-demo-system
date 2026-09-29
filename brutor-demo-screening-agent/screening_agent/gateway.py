@@ -138,6 +138,17 @@ class ToolError(GatewayError):
     """The tool ran and reported an error (JSON-RPC error or result.isError)."""
 
 
+class GatewayUnreachable(GatewayError):
+    """No HTTP answer at all: DNS failure, connection refused or reset, timeout.
+
+    The gateway (or the network to it) is not there; nothing was decided about
+    the request. failures.py classifies it as a system condition."""
+
+
+class DelegateFailed(ToolError):
+    """The A2A delegate answered, but its task ended FAILED / REJECTED / CANCELED."""
+
+
 def _short(value: Any, limit: int = 200) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str)
     return text if len(text) <= limit else text[: limit - 3] + "..."
@@ -462,7 +473,7 @@ class Gateway:
             raise self._llm_status_error(exc) from exc
         except openai_sdk.APIError as exc:
             self._log_call("llm", model, "error", step_id, (time.monotonic() - started) * 1000, node)
-            raise GatewayError(f"llm call failed: {exc}") from exc
+            raise self._llm_transport_error("llm call failed", exc) from exc
         self._log_call("llm", model, raw.status_code, step_id, (time.monotonic() - started) * 1000, node)
         self._note_response(raw, run_end=hdr.get(RUN_END_HEADER))
         completion = raw.parse()
@@ -490,7 +501,7 @@ class Gateway:
             raise self._llm_status_error(exc) from exc
         except openai_sdk.APIError as exc:
             self._log_call("llm_responses", model, "error", step_id, (time.monotonic() - started) * 1000, node)
-            raise GatewayError(f"llm responses call failed: {exc}") from exc
+            raise self._llm_transport_error("llm responses call failed", exc) from exc
         self._log_call("llm_responses", model, raw.status_code, step_id, (time.monotonic() - started) * 1000, node)
         self._note_response(raw, run_end=hdr.get(RUN_END_HEADER))
         try:
@@ -514,6 +525,17 @@ class Gateway:
                 if isinstance(part, dict) and part.get("type") in ("output_text", "text") and isinstance(part.get("text"), str):
                     chunks.append(part["text"])
         return "".join(chunks)
+
+    @staticmethod
+    def _llm_transport_error(what: str, exc: Any) -> GatewayError:
+        """An SDK error without an HTTP status: a connection error or timeout is
+        GatewayUnreachable; anything else (a response the SDK could not
+        validate) stays a plain GatewayError."""
+        import openai as openai_sdk
+
+        if isinstance(exc, openai_sdk.APIConnectionError):  # includes APITimeoutError
+            return GatewayUnreachable(f"{what}: {exc}")
+        return GatewayError(f"{what}: {exc}")
 
     @staticmethod
     def _llm_status_error(exc: Any) -> GatewayError:
@@ -573,7 +595,7 @@ class Gateway:
             response = self.http.post(f"{self.base}/v1/proxy/mcp/{server_id}", json=body, headers=hdr)
         except httpx.HTTPError as exc:
             self._log_call("mcp", tool, "error", step_id, (time.monotonic() - started) * 1000, node)
-            raise GatewayError(f"mcp call {tool} failed: {exc}") from exc
+            raise GatewayUnreachable(f"mcp call {tool} failed: {exc}") from exc
         self._log_call("mcp", tool, response.status_code, step_id, (time.monotonic() - started) * 1000, node)
         payload = self._parse_body(response)
         self._raise_for_status(response, payload)
@@ -645,7 +667,7 @@ class Gateway:
             response = self.http.post(f"{self.base}/v1/proxy/a2a/outbound", json=body, headers=hdr)
         except httpx.HTTPError as exc:
             self._log_call("a2a", capability, "error", step_id, (time.monotonic() - started) * 1000, node)
-            raise GatewayError(f"a2a delegation failed: {exc}") from exc
+            raise GatewayUnreachable(f"a2a delegation failed: {exc}") from exc
         self._log_call("a2a", capability, response.status_code, step_id, (time.monotonic() - started) * 1000, node)
         out = self._parse_body(response)
         self._raise_for_status(response, out)
@@ -658,7 +680,7 @@ class Gateway:
         status = task.get("status") or {}
         state = str(status.get("state", "")).upper()
         if "FAILED" in state or "REJECTED" in state or "CANCELED" in state or "CANCELLED" in state:
-            raise ToolError(f"a2a task ended {state}: {_short(status)}", body=out)
+            raise DelegateFailed(f"a2a task ended {state}: {_short(status)}", body=out)
         parts = (status.get("message") or {}).get("parts") or []
         text = ""
         for part in parts:
@@ -721,7 +743,7 @@ class Gateway:
             response = self.http.get(f"{self.base}/v1/portal/approvals/{approval_id}/poll", headers=hdr)
         except httpx.HTTPError as exc:
             self._log_call("approval_poll", approval_id, "error", None, (time.monotonic() - started) * 1000)
-            raise GatewayError(f"approval poll failed: {exc}") from exc
+            raise GatewayUnreachable(f"approval poll failed: {exc}") from exc
         self._log_call("approval_poll", approval_id, response.status_code, None, (time.monotonic() - started) * 1000)
         if response.status_code == 404:
             return {"id": approval_id, "status": "not_found"}

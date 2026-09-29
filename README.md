@@ -80,8 +80,19 @@ policy. A `decline`, or an `amount_eur` above 25,000, returns HTTP 202
 `approval_required`. The agent adds a note, stores the pending approval, ends
 the run `escalated`, and polls on later ticks. When an underwriter approves,
 the agent re-issues the identical call with the approval token in a short
-`apply_approved_decision` run. Rejected or expired approvals get a note and
-are dropped.
+`apply_approved_decision` run. Expired holds are re-raised; a rejected one is
+handed off to manual review (`applications_hand_off`, status
+`needs_manual_review`) and dropped.
+
+Failures are classified (`screening_agent/failures.py`): a guardrail or policy
+refusal of an application's content, or a tool error about it, is the
+application's and hands it off to manual review after three attempts; an
+outage, a provider out of credits (429), a resilience gate (503), an
+`approval_required` hold after an autonomy demotion, `autonomy_denied` or a run
+abort is the system's: never counted, the tick stops and the agent backs off
+(10, 20, 40, 80 minutes, then every 70). Held and skipped applications never
+starve new ones (the pending listing pages on). `./demo.sh requeue` puts
+handed-off applications back in the queue.
 
 Terminal states: `completed` + `resolved` on the normal path, `completed` +
 `escalated` on a hold, `errored` if a node raises, `blocked_policy` on a
@@ -148,6 +159,7 @@ Then:
 ./demo.sh logs screening-agent
 ./demo.sh run-one [APP-id]    # process exactly one pending application now
 ./demo.sh generate 5          # add five synthetic applications
+./demo.sh requeue --all-skipped   # re-queue what the agent handed off to manual review
 python3 brutor-demo-setup/verify.py   # full read-back with the section 9 expectations
 ```
 
@@ -180,11 +192,16 @@ In the Admin Console (http://localhost:3002, `admin` / `Admin123!` on tenant
 
 ## Approving a held decision
 
-The trial's approval window is 300 seconds. If nobody decides in time, the agent
+Setup gives every approval hold a 24-hour window: the organisation's approval
+window (Governance → Approvals on `borealis-consumer-finance`, inherited by both AI
+Systems) covers every hold — the recommendation band, notes, skill runs and holds raised
+while a drift response has demoted the system (platform a193 and later; older platforms
+keep the 300-second default). If nobody decides in time, the agent
 records a note, the application stays in `received`, and the next tick screens it
 again and raises a fresh approval, so the queue always shows the current decision
-until an underwriter acts. Rejecting an approval also leaves a note on the
-application.
+until an underwriter acts. Rejecting an approval hands the application off to
+manual review (status `needs_manual_review`, with a note), so it is not screened
+into a fresh hold again.
 
 
 1. Wait for a run to end `escalated` (the log line says "held for
@@ -235,8 +252,15 @@ cp .env.example .env        # set OPENAI_API_KEY
 
 The demo is a source-built add-on. It is not part of the platform release scripts
 or the trial bundle: `./demo.sh up` builds its four images locally and provisions
-against whatever trial stack is running. Last verified against platform 0.10.93
-on 2026-09-23.
+against whatever trial stack is running. Last verified against platform 0.11.6
+on 2026-09-29.
+
+**Requires platform 0.11.6 or later.** Setup declares things older platforms do not
+have: the fraud screener as a dependency of the Demo System (composite AI Systems),
+the agents' implementation name and approved versions (agent release identity), and
+the 24-hour approval window on the organisation. On an older platform, setup stops
+with an error at the first declaration the platform does not accept (the approval
+window only warns, and holds then keep the 300-second default).
 
 ## What the demo does not claim
 

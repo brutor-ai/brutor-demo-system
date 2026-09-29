@@ -192,16 +192,19 @@ def test_scheduler_retries_then_skips(settings, fake, tmp_path):
         assert [p["state"] for p in summary["processed"]] == ["blocked_policy"], f"tick {i}"
     assert sched.tracker.is_skipped("APP-20260923-001")
     assert sched.status["runs_blocked"] == 3
-    # the give-up note was added in its own closed run
-    give_up = [c for c in fake.calls if c.tool == "applications_add_note"]
+    # the hand-off (terminal status needs_manual_review) ran in its own closed run
+    give_up = [c for c in fake.calls if c.tool == "applications_hand_off"]
     assert len(give_up) == 1
+    assert fake.status_of("APP-20260923-001") == "needs_manual_review"
+    assert sched.tracker.skipped()["APP-20260923-001"]["handed_off"] is True
+    assert sched.tracker.skipped()["APP-20260923-001"]["failure_kind"] == "content_blocked"
     assert give_up[0].headers["x-brutor-run-end"] == "completed"
     assert give_up[0].headers["x-brutor-run-outcome"] == "handed_off"
     assert give_up[0].headers["x-brutor-step-id"] == "give_up"
-    # fourth tick: listed but skipped, no run
+    # fourth tick: it left the pending set, so nothing is listed and no run opens
     before = len(fake.calls)
     summary = sched.tick()
-    assert summary["processed"] == [] and summary["skipped"] == ["APP-20260923-001"]
+    assert summary["processed"] == [] and summary["skipped"] == []
     assert [c.tool for c in fake.calls[before:]] == ["applications_list_pending"]
     # the listing runs in its own short run, closed on that single call
     listing = [c for c in fake.calls if c.tool == "applications_list_pending"]

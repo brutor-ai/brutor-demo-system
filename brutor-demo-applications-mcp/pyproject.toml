@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brutor-demo-applications-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mock loan origination system for the Brutor Demo System, exposed as an MCP server (FastMCP, streamable HTTP, stateless)."
 readme = "README.md"
 requires-python = ">=3.12"
