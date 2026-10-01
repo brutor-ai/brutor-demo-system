@@ -697,10 +697,11 @@ Continuous checks (tier A, demo system; run facts from `RUN_FACT_KEYS`):
   "sensitivity": {"personal_data": true, "financial": true},
   "interacts_with_natural_persons": true, "generates_synthetic_content": false,
   "automated_decisions_about_persons": true, "two_phase_actions": true,
-  "oversight_assignment": "Underwriter on duty (credit-risk@borealis.example)"},
+  "oversight_assignment": "Underwriter on duty (credit-risk@borealis.example)",
+  "notes": "Annex III point 5(b): evaluation of the creditworthiness of natural persons. Conformity assessment by internal control (Annex VI); demo."},
  "frameworks": {"eu-ai-act": {"role": "provider_and_deployer", "risk_tier": "high",
-  "in_scope": true, "annex": "III", "annex_iii_area": "5(b) creditworthiness evaluation of natural persons",
-  "conformity_assessment": "internal control (Annex VI), demo",
+  "in_scope": true, "annex": "annex_iii", "annex_iii_area": "5",
+  "conformity_assessment": "internal",
   "instructions_for_use_reference": "brutor-demo-setup/docs/instructions-for-use.md",
   "qms_reference": "brutor-demo-setup/docs/risk-assessment.md",
   "ai_literacy_reference": "brutor-demo-setup/docs/instructions-for-use.md#staff-training"}}}
@@ -709,7 +710,15 @@ Continuous checks (tier A, demo system; run facts from `RUN_FACT_KEYS`):
 The profile PUT is strict (unknown keys 422). If a key above is rejected, drop that
 key, keep going, and print what was dropped. The fraud screener profile is the same
 core block with `automated_decisions_about_persons: false` and eu-ai-act `risk_tier:
-"minimal"`, `in_scope: true`, note "Art 6(3) / Annex III 5(b) fraud-detection carve-out".
+"minimal"`, `in_scope: true`, `annex: "annex_iii"`, `annex_iii_area: "5"`, and the note
+"Annex III point 5(b) excludes AI systems used to detect financial fraud (Art 6(3)), so
+this system is declared minimal risk."
+
+`annex`, `annex_iii_area` and `conformity_assessment` are choices, not prose: `none |
+annex_i | annex_iii`, the area number `1` to `8`, and `internal | notified_body` (the
+values the console's profile form offers). A value outside them reads "not declared" in
+the console, and from the platform release after 0.11.8 the PUT refuses it. The point
+within an area ("5(b)") goes in `core.notes`.
 
 Art 50 notice config for the demo system: enabled, surface `inline`, text (en)
 "You are interacting with an AI system operated by Borealis Consumer Finance AB. A

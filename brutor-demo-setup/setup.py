@@ -1573,24 +1573,32 @@ class Provisioner:
             "automated_decisions_about_persons": True, "two_phase_actions": True,
             "oversight_assignment": "Underwriter on duty (credit-risk@borealis.example)",
         }
+        # annex / annex_iii_area / conformity_assessment are choices, not prose:
+        # the platform's vocabulary is none | annex_i | annex_iii, the area
+        # number 1 to 8, and internal | notified_body (what the console's
+        # profile form offers). The point within the area goes in the notes.
+        demo_core = dict(core, notes="Annex III point 5(b): evaluation of the creditworthiness of "
+                                     "natural persons. Conformity assessment by internal control "
+                                     "(Annex VI); demo.")
         demo_profile = {
-            "core": core,
+            "core": demo_core,
             "frameworks": {"eu-ai-act": {
                 "role": "provider_and_deployer", "risk_tier": "high", "in_scope": True,
-                "annex": "III", "annex_iii_area": "5(b) creditworthiness evaluation of natural persons",
-                "conformity_assessment": "internal control (Annex VI), demo",
+                "annex": "annex_iii", "annex_iii_area": "5",
+                "conformity_assessment": "internal",
                 "instructions_for_use_reference": "brutor-demo-setup/docs/instructions-for-use.md",
                 "qms_reference": "brutor-demo-setup/docs/risk-assessment.md",
                 "ai_literacy_reference": "brutor-demo-setup/docs/instructions-for-use.md#staff-training",
             }},
         }
         fraud_core = dict(core, automated_decisions_about_persons=False,
-                          notes="Art 6(3) / Annex III 5(b) fraud-detection carve-out")
+                          notes="Annex III point 5(b) excludes AI systems used to detect financial "
+                                "fraud (Art 6(3)), so this system is declared minimal risk.")
         fraud_profile = {
             "core": fraud_core,
             "frameworks": {"eu-ai-act": {
                 "role": "provider_and_deployer", "risk_tier": "minimal", "in_scope": True,
-                "annex": "III", "annex_iii_area": "5(b) fraud-detection carve-out, Art 6(3)",
+                "annex": "annex_iii", "annex_iii_area": "5",
             }},
         }
         self._put_profile("demo", demo_gid, demo_profile)
