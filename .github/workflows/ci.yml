@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   secrets-guard:
+    timeout-minutes: 20
     name: No secrets tracked
     runs-on: ubuntu-latest
     steps:
@@ -41,6 +42,7 @@ jobs:
           echo "No env files or API keys tracked."
 
   tests:
+    timeout-minutes: 20
     name: Tests · ${{ matrix.component }} · py${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
@@ -66,6 +68,7 @@ jobs:
         run: python -m pytest -q
 
   skill:
+    timeout-minutes: 20
     name: Tests · affordability skill
     runs-on: ubuntu-latest
     steps:
@@ -79,6 +82,7 @@ jobs:
         run: python -m pytest -q
 
   setup:
+    timeout-minutes: 20
     name: Setup scripts and compose
     runs-on: ubuntu-latest
     defaults:
@@ -108,6 +112,7 @@ jobs:
           docker compose -f docker-compose.yml --profile agent config --quiet
 
   images:
+    timeout-minutes: 20
     name: Image · ${{ matrix.component }}
     runs-on: ubuntu-latest
     strategy:

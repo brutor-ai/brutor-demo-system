@@ -140,9 +140,18 @@ proxy :8100, network `brutor-network`), Docker, Python 3.10+, an OpenAI key.
 ```bash
 cd brutor-demo-system/brutor-demo-setup
 cp .env.example .env          # set OPENAI_API_KEY
-python3 -m pip install -r requirements.txt
+python3 -m venv .venv         # a virtual environment for the setup scripts
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ./demo.sh up
 ```
+
+The virtual environment keeps the setup scripts' dependencies (`setup.py`,
+`verify.py`) out of your system Python; `.venv/` is git-ignored. `demo.sh` runs
+whichever `python3` is first on your `PATH`, which is the environment's while it
+is active, so activate it again in every new terminal before running `demo.sh`
+or the scripts: `source .venv/bin/activate` from `brutor-demo-setup`. The
+containers bring their own Python and need nothing from it.
 
 `demo.sh up` builds and starts the two MCP servers and the fraud agent, waits
 for their `/health`, runs `setup.py` (which prints one line per provisioning
@@ -160,7 +169,7 @@ Then:
 ./demo.sh run-one [APP-id]    # process exactly one pending application now
 ./demo.sh generate 5          # add five synthetic applications
 ./demo.sh requeue --all-skipped   # re-queue what the agent handed off to manual review
-python3 brutor-demo-setup/verify.py   # full read-back with the section 9 expectations
+python verify.py              # full read-back with the section 9 expectations
 ```
 
 ## What to look at afterwards
@@ -245,6 +254,8 @@ https://github.com/brutor-ai/brutor-demo-system (the six component folders in th
 git clone https://github.com/brutor-ai/brutor-demo-system.git
 cd brutor-demo-system/brutor-demo-setup
 cp .env.example .env        # set OPENAI_API_KEY
+python3 -m venv .venv && source .venv/bin/activate
+python -m pip install -r requirements.txt
 ./demo.sh up                # against a running trial bundle
 ```
 

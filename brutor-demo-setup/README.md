@@ -40,7 +40,9 @@ proxy on :8100, docker network `brutor-network`), Docker, Python 3.10+.
 ```bash
 cd brutor-demo-setup
 cp .env.example .env            # set OPENAI_API_KEY
-python3 -m pip install -r requirements.txt
+python3 -m venv .venv            # virtual environment for setup.py / verify.py (git-ignored)
+source .venv/bin/activate        # again in every new terminal
+python -m pip install -r requirements.txt
 ./demo.sh up                     # build, start, provision, start the agent
 ./demo.sh status                 # four /health endpoints + verify.py --brief
 ./demo.sh logs screening-agent   # watch the ticks

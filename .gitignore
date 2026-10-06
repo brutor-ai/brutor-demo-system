@@ -8,6 +8,9 @@
 .env.*
 !.env.example
 .demo.env
+# ...and every copy of it (a .demo.env.pre-wipe-2026-10-01 backup was committed
+# with two Brutor API keys on 2026-10-01; both were already dead)
+.demo.env*
 *.pem
 *.key
 
