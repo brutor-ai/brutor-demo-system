@@ -72,4 +72,10 @@ def verdict_of(response):
     assert task["status"]["message"]["role"] == "ROLE_AGENT"
     part = task["status"]["message"]["parts"][0]
     assert part["kind"] == "text"
-    return json.loads(part["text"])
+    verdict = json.loads(part["text"])
+    # RFC 0025 7a: every completed task reports its declared outcome on both
+    # carriers, and both name the verdict it carries.
+    expected = f"screening_completed.{verdict['verdict']}"
+    assert response.headers["x-brutor-outcome-id"] == expected
+    assert task["metadata"] == {"brutor.outcome.id": expected}
+    return verdict

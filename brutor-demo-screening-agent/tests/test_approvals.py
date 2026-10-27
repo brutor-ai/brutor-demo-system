@@ -62,7 +62,8 @@ def test_approved_applies_and_rejected_drops(settings, fake, tmp_path):
     assert counts == {"approved": 1, "rejected": 1, "reraised": 0, "applied_without_hold": 0, "handed_off": 0, "pending": 1, "errored": 0}
     assert [e["approval_id"] for e in store.all()] == ["apr-pending"]
 
-    # approved -> identical call re-issued with the token in its own run, closed resolved
+    # approved -> identical call re-issued with the token in its own run, closed
+    # with the declared underwriter_decision_applied
     assert len(fake.recorded) == 1
     assert fake.recorded[0]["args"] == ARGS and fake.recorded[0]["token"] == "tok-abc"
     apply_calls = [c for c in fake.calls if c.tool == "applications_set_recommendation"]
@@ -70,15 +71,16 @@ def test_approved_applies_and_rejected_drops(settings, fake, tmp_path):
     h = apply_calls[0].headers
     assert h["x-brutor-run-id"].startswith("bds-APP-20260923-001-approval-")
     assert h["x-brutor-step-id"] == "apply_approved_decision"
-    assert h["x-brutor-run-end"] == "completed" and h["x-brutor-run-outcome"] == "resolved"
+    assert h["x-brutor-run-end"] == "completed"
+    assert h["x-brutor-outcome-id"] == "application_processed.underwriter_decision_applied"
     assert h["x-approval-token"] == "tok-abc"
 
     # rejected -> hand-off in a short run (needs_manual_review, so it is never
-    # re-screened into a fresh hold), handed_off, dropped
+    # re-screened into a fresh hold), sent_to_manual_review, dropped
     hand_offs = [c for c in fake.calls if c.tool == "applications_hand_off"]
     assert len(hand_offs) == 1
     assert hand_offs[0].headers["x-brutor-run-end"] == "completed"
-    assert hand_offs[0].headers["x-brutor-run-outcome"] == "handed_off"
+    assert hand_offs[0].headers["x-brutor-outcome-id"] == "application_processed.sent_to_manual_review"
     assert hand_offs[0].headers["x-brutor-run-id"].startswith("bds-APP-20260923-002-approval-")
     assert "rejected" in fake.handed_off[0]["reason"]
     assert fake.status_of("APP-20260923-002") == "needs_manual_review"
@@ -103,7 +105,8 @@ def test_expired_hold_is_reraised_not_dropped(settings, fake, tmp_path):
     # nothing recorded, no notes, both applications are still held
     assert fake.recorded == [] and fake.notes == []
     assert store.application_ids() == {"APP-20260923-001", "APP-20260923-002"}
-    # the rehold runs: identical args, own run id, step, closed escalated on that one call
+    # the rehold runs: identical args, own run id, step, closed on that one
+    # call as underwriter_hold_renewed
     rehold = [c for c in fake.calls if c.tool == "applications_set_recommendation"]
     assert len(rehold) == 2
     for c in rehold:
@@ -115,7 +118,7 @@ def test_expired_hold_is_reraised_not_dropped(settings, fake, tmp_path):
         assert c.headers["x-brutor-step-name"] == "Re-raise underwriter approval"
         assert c.headers["x-brutor-turn-seq"] == "1"
         assert c.headers["x-brutor-run-end"] == "completed"
-        assert c.headers["x-brutor-run-outcome"] == "escalated"
+        assert c.headers["x-brutor-outcome-id"] == "application_processed.underwriter_hold_renewed"
     assert len({c.run_id for c in rehold}) == 2
     assert fake.run_ends == []
 
@@ -144,6 +147,11 @@ def test_reraise_recorded_without_hold_is_applied(settings, fake, tmp_path):
     assert counts["applied_without_hold"] == 1 and counts["reraised"] == 0
     assert store.all() == []
     assert fake.recorded[0]["args"] == ARGS and fake.recorded[0]["token"] is None
+    # the header had already declared the renewal; MCP-only runs cannot be
+    # re-closed (no derived root), so nothing else is sent
+    [rehold] = [c for c in fake.calls if c.tool == "applications_set_recommendation"]
+    assert rehold.outcome_id == "application_processed.underwriter_hold_renewed"
+    assert fake.run_ends == []
 
 
 def test_reraise_max_hands_off(settings, fake, tmp_path):
@@ -160,7 +168,7 @@ def test_reraise_max_hands_off(settings, fake, tmp_path):
     assert store.all() == []
     assert len(fake.handed_off) == 1 and "expired 2 times" in fake.handed_off[0]["reason"]
     hand_off = [c for c in fake.calls if c.tool == "applications_hand_off"][0]
-    assert hand_off.headers["x-brutor-run-outcome"] == "handed_off"
+    assert hand_off.headers["x-brutor-outcome-id"] == "application_processed.sent_to_manual_review"
 
 
 def test_rejected_falls_back_to_a_note_when_hand_off_fails(settings, fake, tmp_path):
@@ -179,6 +187,13 @@ def test_rejected_falls_back_to_a_note_when_hand_off_fails(settings, fake, tmp_p
     counts = resolve_pending(gw, settings, store)
     assert counts["rejected"] == 1 and store.all() == []
     assert len(fake.notes) == 1 and "rejected" in fake.notes[0]["note"]
+    # the hand-off run failed (no outcome); the note run is the hold closed with a note
+    hand_off = [c for c in fake.calls if c.tool == "applications_hand_off"][0]
+    note = [c for c in fake.calls if c.tool == "applications_add_note"][0]
+    assert hand_off.headers["x-brutor-outcome-id"] == "application_processed.sent_to_manual_review"  # sent on the attempt
+    assert note.headers["x-brutor-run-end"] == "completed"
+    assert note.headers["x-brutor-outcome-id"] == "application_processed.underwriter_hold_closed"
+    assert note.headers["x-brutor-step-id"] == "approval_closed" and note.run_id != hand_off.run_id
 
 
 def test_approved_apply_is_not_dropped_by_a_system_outage(settings, fake, tmp_path):
@@ -203,6 +218,35 @@ def test_approved_apply_is_not_dropped_by_a_system_outage(settings, fake, tmp_pa
     fake.intercept = None
     assert resolve_pending(gw, settings, store)["approved"] == 1
     assert store.all() == [] and fake.recorded[0]["token"] == "tok-abc"
+    # every failed attempt carried the outcome it would have closed with; none
+    # was answered, so none closed (the gateway records the failed call)
+    attempts = [c for c in fake.calls if c.tool == "applications_set_recommendation"]
+    assert len(attempts) == MAX_APPLY_ATTEMPTS + 3
+    assert {c.outcome_id for c in attempts} == {"application_processed.underwriter_decision_applied"}
+
+
+def test_apply_that_fails_three_times_closes_the_hold_with_a_note(settings, fake, tmp_path):
+    """Application-class apply failures: after MAX_APPLY_ATTEMPTS the entry is
+    dropped and a note says so, closed as underwriter_hold_closed."""
+    import httpx
+
+    from screening_agent.approvals import MAX_APPLY_ATTEMPTS
+
+    store = PendingApprovals(tmp_path)
+    store.add("APP-20260923-001", "apr-approved", ARGS, "bds-a")
+    fake.approval_statuses = {"apr-approved": {"status": "approved", "approval_token": "tok-abc"}}
+    fake.intercept = lambda tool, args, call: (
+        httpx.Response(422, json={"error": "invalid recommendation record"}) if tool == "applications_set_recommendation" else None
+    )
+    gw = fake.gateway(settings)
+    for _ in range(MAX_APPLY_ATTEMPTS):
+        resolve_pending(gw, settings, store)
+    assert store.all() == []
+    [note] = [c for c in fake.calls if c.tool == "applications_add_note"]
+    assert "could not be recorded after 3 attempts" in note.body["params"]["arguments"]["note"]
+    assert note.headers["x-brutor-run-end"] == "completed"
+    assert note.outcome_id == "application_processed.underwriter_hold_closed"
+    assert note.run_id.startswith("bds-APP-20260923-001-approval-")
 
 
 def test_reraise_failure_keeps_entry(settings, fake, tmp_path):

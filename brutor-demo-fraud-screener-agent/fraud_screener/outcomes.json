@@ -1,0 +1,15 @@
+{
+  "outcomes": [
+    {
+      "id": "screening_completed",
+      "label": "Applicant screened",
+      "description": "The applicant was screened for sanctions-list matches and fraud indicators; the variant is the verdict.",
+      "counts_toward_baseline": true,
+      "variants": [
+        {"id": "clear", "label": "Verdict: clear"},
+        {"id": "review", "label": "Verdict: review"},
+        {"id": "hit", "label": "Verdict: hit"}
+      ]
+    }
+  ]
+}

@@ -14,7 +14,7 @@ MSGS = [
 
 
 def _header_subset(call):
-    keys = ("x-brutor-run-id", "x-brutor-turn-id", "x-brutor-turn-seq", "x-brutor-step-id", "x-brutor-step-name", "x-brutor-run-end", "x-brutor-run-outcome", "x-tenant-id")
+    keys = ("x-brutor-run-id", "x-brutor-turn-id", "x-brutor-turn-seq", "x-brutor-step-id", "x-brutor-step-name", "x-brutor-run-end", "x-brutor-outcome-id", "x-tenant-id")
     return {k: call.headers.get(k) for k in keys}
 
 
@@ -37,7 +37,7 @@ def test_responses_path_headers_and_json(settings, fake):
         resp = gw.llm("gpt-5.2", MSGS, api="responses", step_id="assess", step_name="Assess", turn=("t1", 1), node="classify")
         assert chat == resp == {"risk_band": "low", "key_factors": ["stable income", "moderate DTI"]}
         assert ctx.derived_root == "root-derived-0001"
-        closing = gw.llm("gpt-5.2", MSGS, api="responses", step_id="decide", step_name="Decide", turn=("t2", 2), node="decide", run_end="completed", outcome="resolved")
+        closing = gw.llm("gpt-5.2", MSGS, api="responses", step_id="decide", step_name="Decide", turn=("t2", 2), node="decide", run_end="completed", outcome_id="application_processed.loan_approved")
         assert closing["risk_band"] == "low"
         assert ctx.closed
     calls = fake.calls_of("llm")
@@ -49,7 +49,7 @@ def test_responses_path_headers_and_json(settings, fake):
     assert calls[1].headers["traceparent"] != calls[0].headers["traceparent"]
     # close headers on the responses route
     assert calls[2].headers["x-brutor-run-end"] == "completed"
-    assert calls[2].headers["x-brutor-run-outcome"] == "resolved"
+    assert calls[2].headers["x-brutor-outcome-id"] == "application_processed.loan_approved"
     assert calls[2].headers["x-brutor-turn-seq"] == "2"
     # body shape of the responses route
     body = calls[1].body

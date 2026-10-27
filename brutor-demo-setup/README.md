@@ -93,6 +93,8 @@ an unexpired `impact_assessment` on file.
 | 7 | Skill `affordability-check`: SKILL.md, `affordability.py` (sandbox), `policy.md`; validated, published, bound |
 | 8 | Agent card `brutor-demo-fraud-screener` from the live card, signed, bound group-side |
 | 9 | Identities `brutor-demo-screening-worker` and `brutor-demo-fraud-screener` with the grants in DESIGN 7.1; one API key each |
+| 9b | Composition: the demo system depends on the fraud screener (shared service, critical), with `expected_outcomes` = the screener's three verdicts, read from the screening agent's `outcomes.json` (RFC 0025) |
+| 9c | Declared outcomes (RFC 0025): `PUT /v1/admin/ai-systems/{id}/outcomes` with each agent's `outcomes.json` (`screening_agent/outcomes.json`, `fraud_screener/outcomes.json`), only when the stored catalogue differs; a platform without the endpoint stops the script. The contracts minted in step 14 capture them |
 | 10 | Portal underwriter: end user `underwriter` ("Anna Berg (Underwriter)"), end-user group `borealis-underwriters`, membership, group bound to the demo system (see below) |
 | 11 | Guardrail configs (org baseline: prompt injection + secrets; system: banned words only), argument policy, the systems' own LLM/MCP/skill limits, operating envelope (DESIGN 7.3) |
 | 12 | Liveness, response policy, three continuous checks |
@@ -194,6 +196,9 @@ sensitive data path is provable rather than filtered.
   `POST /v1/admin/end-users`, `POST /v1/admin/end-user-groups`,
   `POST /v1/admin/end-user-groups/{id}/members` and
   `POST /v1/admin/resource-groups/{gid}/end-user-groups` for the underwriter.
+  RFC 0025: `GET` / `PUT /v1/admin/ai-systems/{id}/outcomes` (body
+  `{"outcomes": [...]}`, answer `{"ai_system_id", "outcomes"}`) and `expected_outcomes`
+  on `POST` / `PATCH /v1/admin/ai-systems/{id}/dependencies`.
 - Portal API on the core proxy (used by the underwriter, not by this repo):
   `POST /v1/portal/auth/login`, `GET /v1/portal/approvals`,
   `POST /v1/portal/approvals/{id}/approve|reject`.

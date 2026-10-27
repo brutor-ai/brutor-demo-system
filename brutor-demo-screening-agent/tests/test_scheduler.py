@@ -125,6 +125,93 @@ def test_system_failures_never_skip_and_back_off(settings, fake, tmp_path, outag
     assert sched.backoff["streak"] == 0 and sched.backoff["ticks_left"] == 0
 
 
+@pytest.mark.parametrize("outage", ["llm-503-gateway-resilience-gated", "llm-429-credit-balance-exhausted"])
+def test_an_outage_probe_is_a_no_work_poll_beside_a_failed_screening(settings, fake, tmp_path, outage):
+    """Brutor Demo System, 2026-10-25, with RFC 0025: the poll is its own run
+    again, closed completed with a declared outcome that does NOT count toward
+    the baseline (applications_dispatched), and the screening is a run of its
+    own that errors at the model call and reports no outcome. The gateway's
+    success rate reads only the screening: the system is failing, not half
+    working. (Replaces the 2026-10-25 poll-fold test.)"""
+    ids = _apps(fake, 2)
+    sched = _scheduler(settings, fake, tmp_path)
+    SYSTEM_OUTAGES[outage](fake)
+    before = len(fake.calls)
+    summary = sched.tick()
+    assert summary["tick_outcome"] == "applications_dispatched"
+    assert [(p["application_id"], p["state"], p["outcome"]) for p in summary["processed"]] == [(ids[0], "errored", None)]
+    probe = fake.calls[before:]
+    runs: dict[str, list] = {}
+    for c in probe:
+        runs.setdefault(c.run_id, []).append(c)
+    tick_id, app_id = list(runs)
+    # the tick run: page + closing call, nothing else, closed before the screening started
+    assert tick_id.startswith("bds-tick-")
+    assert [c.tool for c in runs[tick_id]] == ["applications_list_pending"] * 2
+    assert probe[: len(runs[tick_id])] == runs[tick_id]
+    assert runs[tick_id][-1].headers["x-brutor-run-end"] == "completed"
+    assert runs[tick_id][-1].outcome_id == "applications_dispatched"
+    # the screening run: its own id, failed at the model call, no close, no outcome
+    assert app_id == summary["processed"][0]["run_id"] and app_id.startswith(f"bds-{ids[0]}-")
+    assert [c.kind for c in runs[app_id]] == ["mcp", "mcp", "mcp", "mcp", "llm"]
+    assert not any("x-brutor-run-end" in c.headers or c.outcome_id for c in runs[app_id])
+    assert fake.run_ends == []  # the model never answered: no derived root to close with
+
+
+def test_a_failing_listing_errors_the_tick_run(settings, fake, tmp_path):
+    """applications_list_pending answers 500: the tick run's only action failed
+    and nothing closes it, so the gateway sweeps it as errored (its last action
+    failed) with no outcome. No application run is opened."""
+    _apps(fake, 2)
+    sched = _scheduler(settings, fake, tmp_path)
+    fake.fail_tool = "applications_list_pending"
+    summary = sched.tick()
+    assert "error" in summary and summary["processed"] == []
+    assert "tick_outcome" not in summary
+    assert summary["backoff"]["last_failure"]["kind"] == "system/server_error"
+    [call] = fake.calls
+    assert call.tool == "applications_list_pending" and call.run_id.startswith("bds-tick-")
+    assert "x-brutor-run-end" not in call.headers and call.outcome_id is None
+    assert fake.run_ends == []
+    assert sched.gw.ctx is None
+
+
+def test_a_successful_empty_poll_reports_no_applications_available(settings, fake, tmp_path):
+    """Nothing pending: one page and the closing call, in one run, closed
+    completed / no_applications_available; no model call, no write."""
+    fake.statuses[SAMPLE_APPLICATION["application_id"]] = "screened"
+    sched = _scheduler(settings, fake, tmp_path)
+    summary = sched.tick()
+    assert summary["processed"] == [] and "error" not in summary
+    assert summary["tick_outcome"] == "no_applications_available"
+    page, close = fake.calls
+    assert page.run_id == close.run_id and page.run_id.startswith("bds-tick-")
+    assert page.body["params"]["arguments"] == {"limit": settings.list_limit}
+    assert "x-brutor-run-end" not in page.headers and page.outcome_id is None
+    assert close.body["params"]["arguments"] == {"limit": 1}
+    assert close.headers["x-brutor-run-end"] == "completed"
+    assert close.outcome_id == "no_applications_available"
+    assert {c.kind for c in fake.calls} == {"mcp"}
+    # a second tick is a second run
+    sched.tick()
+    assert len({c.run_id for c in fake.calls}) == 2
+
+
+def test_a_tick_that_finds_work_reports_applications_dispatched_and_closes_first(settings, fake, tmp_path):
+    ids = _apps(fake, 3)
+    settings.max_per_tick = 2
+    sched = _scheduler(settings, fake, tmp_path)
+    summary = sched.tick()
+    assert summary["tick_outcome"] == "applications_dispatched"
+    assert [p["application_id"] for p in summary["processed"]] == ids[:2]
+    assert [p["outcome"] for p in summary["processed"]] == ["application_processed.loan_approved"] * 2
+    tick_calls = [c for c in fake.calls if c.run_id.startswith("bds-tick-")]
+    assert fake.calls[:2] == tick_calls  # the tick run closed before any screening began
+    assert tick_calls[-1].outcome_id == "applications_dispatched"
+    assert {p["run_id"].split("-")[1] for p in summary["processed"]} == {"APP"}
+    assert len({p["run_id"] for p in summary["processed"]}) == 2
+
+
 def test_system_failure_stops_the_tick_and_the_tripping_application_goes_last(settings, fake, tmp_path):
     ids = _apps(fake, 3)
     sched = _scheduler(settings, fake, tmp_path)
@@ -174,7 +261,8 @@ def test_application_failures_skip_after_three_and_hand_off(settings, fake, tmp_
 
     first = sched.tick()
     # an application-class failure does not stop the tick: the others are screened
-    assert [(p["application_id"], p["state"]) for p in first["processed"]] == [(bad, "blocked_policy"), (ids[1], "completed"), (ids[2], "completed")]
+    assert [(p["application_id"], p["state"]) for p in first["processed"]] == [(bad, "errored"), (ids[1], "completed"), (ids[2], "completed")]
+    assert sched.status["runs_blocked"] == 1 and sched.status["runs_errored"] == 0  # a block is counted as blocked
     assert first["processed"][0]["failure"] == "application/content_blocked"
     assert sched.tracker.attempts(bad) == 1
     sched.tick()
@@ -186,15 +274,19 @@ def test_application_failures_skip_after_three_and_hand_off(settings, fake, tmp_
     [hand_off] = [c for c in fake.calls if c.tool == "applications_hand_off"]
     assert hand_off.run_id.startswith(f"bds-{bad}-giveup-")
     assert hand_off.headers["x-brutor-step-id"] == "give_up"
-    assert hand_off.headers["x-brutor-run-end"] == "completed" and hand_off.headers["x-brutor-run-outcome"] == "handed_off"
+    assert hand_off.headers["x-brutor-run-end"] == "completed"
+    assert hand_off.outcome_id == "application_processed.sent_to_manual_review"
     assert "gave up after 3 attempts (content_blocked)" in fake.handed_off[0]["reason"]
     assert sched.backoff["streak"] == 0 and sched.status["system_failures"] == 0
 
-    # it left the pending set: the next tick lists nothing and opens no run
+    # it left the pending set: the next tick screens nothing and closes its
+    # tick run on one more read-only listing call as no_applications_available
     before = len(fake.calls)
     summary = sched.tick()
     assert summary["processed"] == [] and summary["skipped"] == []
-    assert [c.tool for c in fake.calls[before:]] == ["applications_list_pending"]
+    assert [c.tool for c in fake.calls[before:]] == ["applications_list_pending"] * 2
+    assert fake.calls[-1].headers["x-brutor-run-end"] == "completed"
+    assert fake.calls[-1].outcome_id == "no_applications_available"
 
 
 def test_failed_hand_off_is_retried_next_tick(settings, fake, tmp_path):
@@ -244,9 +336,16 @@ def test_a_full_window_of_held_and_skipped_applications_does_not_starve_new_ones
     assert {p["state"] for p in summary["processed"]} == {"completed"}
     assert len(summary["held"]) == 120 and len(summary["skipped"]) == 30
     listing = [c for c in fake.calls if c.tool == "applications_list_pending"]
-    assert [c.body["params"]["arguments"].get("after") for c in listing] == [None, held[99]]
-    assert all(c.body["params"]["arguments"]["limit"] == 100 for c in listing)
-    assert all(c.run_id.startswith("bds-tick-") and c.headers["x-brutor-run-end"] == "completed" for c in listing)
+    pages, close = listing[:-1], listing[-1]
+    assert [c.body["params"]["arguments"].get("after") for c in pages] == [None, held[99]]
+    assert all(c.body["params"]["arguments"]["limit"] == 100 for c in pages)
+    # both pages and the closing call are the tick's own run; each new
+    # application is screened in a run of its own
+    assert len({c.run_id for c in listing}) == 1 and listing[0].run_id.startswith("bds-tick-")
+    assert not any("x-brutor-run-end" in c.headers for c in pages)
+    assert close.body["params"]["arguments"] == {"limit": 1}
+    assert close.headers["x-brutor-run-end"] == "completed" and close.outcome_id == "applications_dispatched"
+    assert [p["run_id"].startswith(f"bds-{a}-") for p, a in zip(summary["processed"], new)] == [True, True]
 
 
 def test_paging_stops_when_the_server_ignores_the_cursor(settings, fake, tmp_path):
@@ -261,7 +360,9 @@ def test_paging_stops_when_the_server_ignores_the_cursor(settings, fake, tmp_pat
     sched = Scheduler(settings, fake.gateway(settings), store, RetryTracker(tmp_path))
     summary = sched.tick()
     assert summary["processed"] == [] and "error" not in summary
-    assert len([c for c in fake.calls if c.tool == "applications_list_pending"]) == 2
+    # two pages, then the closing call (nothing screenable)
+    listing = [c for c in fake.calls if c.tool == "applications_list_pending"]
+    assert len(listing) == 3 and listing[-1].outcome_id == "no_applications_available"
 
 
 def test_paging_is_bounded(settings, fake, tmp_path):
@@ -272,7 +373,11 @@ def test_paging_is_bounded(settings, fake, tmp_path):
         _hold(store, fake, app_id)
     sched = Scheduler(settings, fake.gateway(settings), store, RetryTracker(tmp_path))
     sched.tick()
-    assert len([c for c in fake.calls if c.tool == "applications_list_pending"]) == 3
+    # three pages (the bound), then the closing call (nothing screenable)
+    listing = [c for c in fake.calls if c.tool == "applications_list_pending"]
+    assert len(listing) == 4 and listing[-1].headers["x-brutor-run-end"] == "completed"
+    assert listing[-1].outcome_id == "no_applications_available"
+    assert len({c.run_id for c in listing}) == 1
 
 
 # -- requeue --------------------------------------------------------------------

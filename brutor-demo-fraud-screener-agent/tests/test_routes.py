@@ -35,8 +35,10 @@ def test_text_part_by_kind_only(client):
 def test_missing_text_part_is_400(client):
     r = client.post("/message:send", json={"message": {"parts": [{"kind": "file", "uri": "x"}]}})
     assert r.status_code == 400
+    assert "x-brutor-outcome-id" not in r.headers  # no task, no outcome: the gateway judges it unreported
     r = client.post("/message:send", content=b"{not json", headers={"content-type": "application/json"})
     assert r.status_code == 400
+    assert "x-brutor-outcome-id" not in r.headers
 
 
 def test_response_shape_exact(client):
@@ -46,7 +48,9 @@ def test_response_shape_exact(client):
     body = r.json()
     assert set(body) == {"task"}
     task = body["task"]
-    assert set(task) == {"id", "contextId", "status"}
+    assert set(task) == {"id", "contextId", "status", "metadata"}
+    assert task["metadata"] == {"brutor.outcome.id": "screening_completed.clear"}
+    assert r.headers["x-brutor-outcome-id"] == "screening_completed.clear"
     assert set(task["status"]) == {"state", "message"}
     verdict = json.loads(task["status"]["message"]["parts"][0]["text"])
     assert set(verdict) == {"verdict", "sanctions_match", "reasons", "model_used"}

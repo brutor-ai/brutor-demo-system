@@ -115,6 +115,18 @@ def _chat_text(text: str) -> Callable[[httpx.Request], httpx.Response]:
     return lambda request: httpx.Response(200, json=body)
 
 
+def _a2a_expecting(gw: Gateway) -> None:
+    gw.a2a_delegate("agentcard-fraud", "screening.fraud_sanctions", {"full_name": "x"}, expected_outcomes={"screening_completed.clear"})
+
+
+def _a2a_answer(headers: dict[str, str], metadata: dict[str, str] | None = None) -> Callable[[httpx.Request], httpx.Response]:
+    """A completed task whose checked outcome (RFC 0025 7a) is in `headers` / `metadata`."""
+    task: dict[str, Any] = {"id": "t", "contextId": "c", "status": {"state": "TASK_STATE_COMPLETED", "message": {"role": "ROLE_AGENT", "parts": [{"kind": "text", "text": '{"verdict": "clear"}'}]}}}
+    if metadata is not None:
+        task["metadata"] = metadata
+    return lambda request: httpx.Response(200, json={"task": task}, headers=headers)
+
+
 def _a2a_task(state: str) -> Callable[[httpx.Request], httpx.Response]:
     body = {"task": {"id": "t", "contextId": "c", "status": {"state": state, "message": {"role": "ROLE_AGENT", "parts": [{"kind": "text", "text": "failed"}]}}}}
     return lambda request: httpx.Response(200, json=body)
@@ -156,6 +168,12 @@ CASES: list[tuple[str, Callable[[Gateway], None], Callable[[httpx.Request], http
     # ---- system: delegate_failed
     ("a2a-task-failed", _a2a, _a2a_task("TASK_STATE_FAILED"), SYSTEM, "delegate_failed"),
     ("a2a-task-rejected", _a2a, _a2a_task("TASK_STATE_REJECTED"), SYSTEM, "delegate_failed"),
+    # ---- system: delegate_deviated (RFC 0025 7a: the gateway's checked outcome)
+    ("a2a-outcome-undeclared", _a2a, _a2a_answer({"x-brutor-outcome-id": "screening_completed.maybe", "x-brutor-outcome-conformance": "undeclared"}), SYSTEM, "delegate_deviated"),
+    ("a2a-outcome-unreported", _a2a, _a2a_answer({"x-brutor-outcome-conformance": "unreported"}), SYSTEM, "delegate_deviated"),
+    ("a2a-outcome-not-judged", _a2a, _a2a_answer({}), SYSTEM, "delegate_deviated"),
+    ("a2a-outcome-unexpected", _a2a_expecting, _a2a_answer({"x-brutor-outcome-id": "screening_completed.hit", "x-brutor-outcome-conformance": "declared"}), SYSTEM, "delegate_deviated"),
+    ("a2a-outcome-metadata-undeclared", _a2a, _a2a_answer({}, {"brutor.outcome.id": "screening_completed.maybe", "brutor.outcome.conformance": "undeclared"}), SYSTEM, "delegate_deviated"),
     # ---- application: content_blocked
     ("llm-403-guardrail", _llm, _json(403, LLM_GUARDRAIL_403), APPLICATION, "content_blocked"),
     ("mcp-403-guardrail-jsonrpc", _mcp, _json(403, MCP_GUARDRAIL_403), APPLICATION, "content_blocked"),
@@ -210,6 +228,10 @@ LIVE_REASONS = [
     ("errored: GatewayError: mcp call applications_get failed: [Errno -2] Name or service not known", SYSTEM, "unreachable"),
     ("blocked_policy: blocked by policy: " + json.dumps(LLM_GUARDRAIL_403), APPLICATION, "content_blocked"),
     ("blocked_policy: blocked by policy: " + json.dumps(AUTONOMY_403), SYSTEM, "governance_refusal"),
+    # RFC 0025: a block closes the run errored; the reason names the exception
+    ("errored: PolicyBlocked: blocked by policy: " + json.dumps(LLM_GUARDRAIL_403), APPLICATION, "content_blocked"),
+    ("errored: PolicyBlocked: blocked by policy: " + json.dumps(AUTONOMY_403), SYSTEM, "governance_refusal"),
+    ("errored: DelegateDeviated: a2a: the delegate's outcome 'screening_completed.maybe' is undeclared", SYSTEM, "delegate_deviated"),
     ("errored: ToolError: applications_get: unknown application APP-1", APPLICATION, "tool_error"),
     ("errored: KeyError: 'applicant'", APPLICATION, "unexpected"),
 ]

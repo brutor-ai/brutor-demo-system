@@ -16,11 +16,15 @@ Every `TICK_SECONDS` (default 600) the agent:
 
 1. resolves pending underwriter approvals (`GET /v1/portal/approvals/{id}/poll`),
 2. retries any hand-off to manual review that did not go through yet,
-3. lists applications with status `received` (`applications_list_pending`, in its own short
-   run `bds-tick-<ulid>` with the single step `poll_pending`, closed on that same call with
-   `X-Brutor-Run-End: completed` / `X-Brutor-Run-Outcome: resolved`, so the ledger never
-   sees a one-call run the idle sweeper has to close as `abandoned`), paging on with the
-   cursor `after` past held and skipped applications until it has `MAX_PER_TICK` to screen,
+3. lists applications with status `received` (`applications_list_pending`, in the tick's
+   own run `bds-tick-<ulid>`, step `poll_pending`), paging on with the cursor `after` past
+   held and skipped applications until it has `MAX_PER_TICK` to screen, and closes the tick
+   run on one more listing call (`limit` 1) with `X-Brutor-Run-End: completed` and
+   `X-Brutor-Outcome-Id: no_applications_available` (nothing to screen) or
+   `applications_dispatched` (work found) — both declared as no work, so a poll never
+   counts as a success of the work, and the ledger never sees a run the idle sweeper has
+   to close as `abandoned` (a listing that fails leaves the tick run with a failed last
+   action, which the gateway sweeps as `errored`),
 4. processes up to `MAX_PER_TICK` (default 5) of them sequentially, one run each, and
    stops early at the first **system** failure (see "Failures" below).
 
@@ -29,7 +33,7 @@ turn > action (ADR 0003): **steps** are phases of the task (`gather`, `assess`, 
 **turns** are model passes (`t1` covers the four reads and the classifier call they feed,
 `t2` covers the fraud screen, the drafter call and the record it triggers), and each node
 makes one **action**. A completed run therefore reads 3 steps, 3 turns and 9 actions (10
-when escalated, because of the note): the ninth action is the fraud screener's own model
+when held for an underwriter, because of the note): the ninth action is the fraud screener's own model
 call, which joins at depth 1 with a turn of its own and no step, since steps are the
 orchestrating agent's phases. The node name is not a header; it appears as `node=` in the
 log line.
@@ -43,7 +47,7 @@ log line.
 | 5 | `classify` (assess / t1) | LLM, classifier model (`gpt-5.2`), JSON output | `high` forces at least `refer` |
 | 6 | `fraud_screen` (assess / t2) | A2A outbound to the Fraud and Sanctions Screener | `hit` forces `decline`, `review` forces at least `refer` |
 | 7 | `decide` (decide / t2) | LLM, drafter model (`gpt-5.5`), JSON output | recommendation, rationale, customer letter |
-| 8 | `record` (decide / t2) | MCP `applications_set_recommendation` (+ `applications_add_note` on a hold) | the last call closes the run |
+| 8 | `record` (decide / t2) | MCP `applications_set_recommendation` (+ `applications_add_note` on a hold) | the last call closes the run with its declared outcome |
 
 The deterministic rules in `rules.py` are applied after the drafter and override it; the
 rationale states which rule fired. The drafter is told the policy floor before it writes,
@@ -55,12 +59,14 @@ sends `temperature` or `top_p`.
 in the gateway: a `decline` or an `amount_eur` above 25,000 answers HTTP 202
 `approval_required`. The agent then adds a note ("Held for underwriter, approval id ..."),
 persists the pending approval to `DATA_DIR/pending_approvals.json`, and closes the run
-`completed` / `escalated`. On a later tick, once a human approved it in the Admin Console
+`completed` / `application_processed.held_for_underwriter`. On a later tick, once a human approved it in the Admin Console
 (Tool Approvals), the agent re-issues the identical call with `X-Approval-Token` in a new
 short run `bds-<application_id>-approval-<ulid>` with the single step
-`apply_approved_decision`, closed `completed` / `resolved`. A rejected hold (and, with
+`apply_approved_decision`, closed `completed` /
+`application_processed.underwriter_decision_applied`. A rejected hold (and, with
 `RERAISE_MAX` set, a hold that expired too often) is handed off: `applications_hand_off`
-in its own short run (`completed` / `handed_off`) moves the application to
+in its own short run (`completed` / `application_processed.sent_to_manual_review`) moves
+the application to
 `needs_manual_review`, so it is not screened into a fresh hold on the next tick. An
 approved decision that cannot be applied is kept and retried; only application-class
 failures count toward its three attempts, so an outage never drops a human's approval.
@@ -71,12 +77,14 @@ expires before an underwriter acts, the agent does **not** re-screen the applica
 does not drop the hold: it re-raises it by re-issuing the identical
 `applications_set_recommendation` call from the stored arguments in a short run
 `bds-<application_id>-rehold-<ulid>` (single step `reraise_approval`, closed `completed` /
-`escalated`). The gateway answers 202 with a new approval id, which replaces the old one in
+`application_processed.underwriter_hold_renewed`). The gateway answers 202 with a new approval id, which replaces the old one in
 `pending_approvals.json` (`reraise_count` increments). A held application is excluded from
 every tick's batch, so it costs no model calls while it waits, and the Tool Approvals queue
 always holds the current decision until an underwriter approves or rejects it. Only a
-rejection closes the entry (note, `handed_off`). If the re-raise is recorded outright
-(the argument policy changed), the decision is treated as applied. `RERAISE_MAX` (default
+rejection closes the entry (hand-off, `sent_to_manual_review`; if the hand-off itself is
+refused, a note, `underwriter_hold_closed`). If the re-raise is recorded outright (the
+argument policy changed), the decision is treated as applied; the run already declared
+`underwriter_hold_renewed` on its closing header and an MCP-only run cannot be re-closed. `RERAISE_MAX` (default
 0, unlimited) caps the re-raises; when reached the application is noted and handed off.
 
 ## Gateway calls and headers
@@ -86,19 +94,50 @@ the AI System comes from the key's resource group; `X-Brutor-AI-System` is never
 
 | Header | Value | When |
 |---|---|---|
-| `x-brutor-run-id` | `bds-<application_id>-<ulid>` (max 128 chars), identical on every call of the run | every call inside a run |
+| `x-brutor-run-id` | `bds-<application_id>-<ulid>`, or `bds-tick-<ulid>` for the tick run (max 128 chars), identical on every call of the run | every call inside a run |
 | `X-Brutor-Turn-Id` | the model pass: `t1` (nodes 1 to 5) or `t2` (nodes 6 to 8) | every call inside a run |
 | `X-Brutor-Turn-Seq` | `1` or `2` | every call inside a run |
 | `X-Brutor-Step-Id` | the phase: `gather` (nodes 1 to 4), `assess` (5 to 6), `decide` (7 to 8); never the node name | every call inside a run |
 | `X-Brutor-Step-Name` | `Gather the application facts`, `Assess risk and fraud`, `Decide and record` | every call inside a run |
 | `traceparent` | `00-<32 hex trace id per run>-<16 hex span id per call>-01` | every call inside a run |
-| `X-Brutor-Run-End` | a literal terminal state: `completed`, `errored`, `blocked_policy`, ... (never `true`) | the last call of the run only |
-| `X-Brutor-Run-Outcome` | `resolved`, `escalated` or `handed_off` | alongside `X-Brutor-Run-End` only |
+| `X-Brutor-Run-End` | a literal terminal state: `completed`, `errored`, ... (never `true`; `blocked_policy` no longer exists) | the last call of the run only |
+| `X-Brutor-Outcome-Id` | a declared outcome from `screening_agent/outcomes.json`, e.g. `application_processed.loan_approved` (see "Declared outcomes") | alongside `X-Brutor-Run-End: completed` only |
 | `X-Approval-Token` | the one-time token from the approval poll | the `apply_approved_decision` call only |
 
-Housekeeping outside application runs: the tick's `applications_list_pending` call is its
-own closed run `bds-tick-<ulid>` (above); the approval polls are `GET /v1/portal/...`
-calls, not proxied actions, and carry no run headers.
+Housekeeping: the tick's `applications_list_pending` calls are the tick's own run
+`bds-tick-<ulid>` (above); the approval polls are `GET /v1/portal/...` calls, not proxied
+actions, and carry no run headers. `X-Brutor-Run-Outcome` (RFC 0010's four fixed values)
+was removed by RFC 0025 and is never sent.
+
+### Declared outcomes (RFC 0025)
+
+`screening_agent/outcomes.json` is the catalogue of how a run may end; `outcomes.py`
+loads it, and `brutor-demo-setup` PUTs the same file's `outcomes` list as the AI
+System's catalogue. The client (`gateway.py`) refuses, before the call, an id that is
+malformed (`^[a-z0-9_-]{1,48}(\.[a-z0-9_-]{1,48})?$`), not in the catalogue (an outcome
+with variants is never sent bare), or sent without `X-Brutor-Run-End: completed`.
+
+| Exit | Outcome id |
+|---|---|
+| `record`, recommendation `approve` / `decline` / `refer` | `application_processed.loan_approved` / `loan_rejected` / `loan_referred` |
+| `record`, the recommendation was held (202), the note closes the run | `application_processed.held_for_underwriter` |
+| approvals: approved decision applied | `application_processed.underwriter_decision_applied` |
+| approvals: lapsed hold re-raised | `application_processed.underwriter_hold_renewed` |
+| approvals: hand-off or apply impossible, a note instead | `application_processed.underwriter_hold_closed` |
+| approvals (rejected, `RERAISE_MAX` reached) and the scheduler's give-up: hand-off | `application_processed.sent_to_manual_review` |
+| tick, nothing to screen | `no_applications_available` (no work) |
+| tick, work found and handed to per-application runs | `applications_dispatched` (no work) |
+| any failed run | none |
+
+**The fraud screener's outcome.** The gateway checks the screener's
+`screening_completed.<verdict>` against the screener's contract and returns
+`X-Brutor-Outcome-Id` + `X-Brutor-Outcome-Conformance` (and the pair in the final Task's
+`metadata`, `brutor.outcome.id` / `brutor.outcome.conformance`). `a2a_delegate` reads
+either carrier (both present must agree) and raises `DelegateDeviated` unless the
+conformance is `declared` and the id is one of the dependency's expected outcomes
+(`clear`, `review`, `hit`). The graph branches on that checked variant, never on the
+body's `verdict` field. A deviation fails the run like an unreachable delegate: system
+class `delegate_deviated`, the tick backs off.
 
 Routes used:
 
@@ -108,8 +147,8 @@ Routes used:
 | LLM (responses) | `POST {gw}/v1/proxy/llm/responses` | Same SDK and headers; `input` = the same messages as `[{role, content}]` items, `text: {"format": {"type": "json_object"}}`. The proxy accepts `model`, `input` (string or items), `instructions`, `max_output_tokens`, `stream` and passes other fields through; it returns the same `x-brutor-run-id` header. The text is read from `output_text`, else from `output[].content[]` items of type `output_text`. |
 | MCP | `POST {gw}/v1/proxy/mcp/{server_id}` | raw JSON-RPC `tools/call`, `Accept: application/json, text/event-stream`. 202 `approval_required` = hold, 403 = policy block, `result.isError` = tool error. |
 | Skill | same, server `system-agent-skill-server-<tenant>`, tool `skills__run_script` | `{"skill_name": "affordability-check", "script": "affordability.py", "args": {...}}` |
-| A2A | `POST {gw}/v1/proxy/a2a/outbound` | `{"target_card_id", "capability": "screening.fraud_sanctions", "message": {...}}`; the verdict JSON is read from `task.status.message.parts[0].text` |
-| Run close (fallback) | `POST {gw}/v1/runs/{derived_root}/end` | `{"state": "errored" or "blocked_policy"}` when a node raised; only possible once an LLM call has answered |
+| A2A | `POST {gw}/v1/proxy/a2a/outbound` | `{"target_card_id", "capability": "screening.fraud_sanctions", "message": {...}}`; the verdict JSON is read from `task.status.message.parts[0].text`, the verdict itself from the checked outcome (above) |
+| Run close (fallback) | `POST {gw}/v1/runs/{derived_root}/end` | `{"state": "errored"}` when a node raised (`{"state": "completed", "outcome_id": ...}` if a header close did not take); only possible once an LLM call has answered |
 | Approval poll | `GET {gw}/v1/portal/approvals/{id}/poll` | `{"status": "pending or approved or rejected or expired", "approval_token"?}` |
 
 **Two model APIs.** Each model is called on either the chat route or the responses route,
@@ -121,11 +160,12 @@ call that gets that 400 is retried on the responses route with the identical hea
 warning is logged, and the model is remembered as responses-only. Run, turn, step and
 close headers are the same on both routes; neither sends `temperature` or `top_p`.
 
-Terminal states: `completed` + `resolved` on the normal path; `completed` + `escalated`
-on an approval hold; `errored` when a node raises; `blocked_policy` on a 403 guardrail or
-policy block. When a run fails before any LLM call has answered there is no derived root
-to close with, the agent logs a warning, and the gateway sweeps the run as `abandoned`
-after the system's idle window (300 s in the demo).
+Terminal states: `completed` with a declared outcome; `errored` when a node raises,
+including a 403 guardrail or policy block (the gateway records the cause
+`blocked_by_policy`). When a run fails before any LLM call has answered there is no
+derived root to close with, the agent logs a warning, and the gateway sweeps the run
+after the system's idle window (300 s in the demo) as `errored`, since its last action
+failed.
 
 ## Failures
 
@@ -136,12 +176,12 @@ the real gateway client):
 | Class | Kinds | Examples the agent sees | Effect |
 |---|---|---|---|
 | **application** | `content_blocked`, `rejected_request`, `tool_error`, `malformed_output`, `unexpected` | 403 `guardrail_blocked` / `semantic_policy_blocked` / argument-policy deny (JSON-RPC -32000); 400/413/422; a tool error about this application; unusable model output; a malformed record | counted per application; after 3 the application is handed off to `needs_manual_review` |
-| **system** | `unreachable`, `server_error`, `rate_limited`, `approval_hold`, `governance_refusal`, `unavailable`, `delegate_failed` | DNS or connection errors; 5xx incl. 503 `gateway_resilience_gated`; 429 incl. `credit_balance_exhausted` and `run_cap_reached`; `skill_error_202: approval_required`; `autonomy_denied`, run aborted, 401, a 403 without a content verdict; 404/409; A2A task FAILED | never counted; the tick stops; exponential backoff |
+| **system** | `unreachable`, `server_error`, `rate_limited`, `approval_hold`, `governance_refusal`, `unavailable`, `delegate_failed`, `delegate_deviated` | DNS or connection errors; 5xx incl. 503 `gateway_resilience_gated`; 429 incl. `credit_balance_exhausted` and `run_cap_reached`; `skill_error_202: approval_required`; `autonomy_denied`, run aborted, 401, a 403 without a content verdict; 404/409; A2A task FAILED; a delegate outcome that is not declared or not expected | never counted; the tick stops; exponential backoff |
 
 **Application failures.** The application stays `received` and is retried on the next
 tick. Application-class attempts are counted in `DATA_DIR/retries.json`; after 3 the agent
 calls `applications_hand_off` (own short run `bds-<id>-giveup-<ulid>`, step `give_up`,
-`completed` / `handed_off`), which moves the application to the terminal status
+`completed` / `application_processed.sent_to_manual_review`), which moves the application to the terminal status
 `needs_manual_review` with the reason as a note, so it leaves the pending set for good.
 That is what stops the prompt-injection sample from looping once the `mcp_output`
 guardrail blocks it. If the hand-off call itself fails, the application stays on the

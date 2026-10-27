@@ -27,6 +27,7 @@ tests/test_failures.py, including the exact error strings seen live on
 | system | governance_refusal | `autonomy_denied: ...`, `run_aborted` / "run aborted by an operator", HTTP 401, a 403 that carries no content verdict (missing grant or access), `skill_error_401/403` |
 | system | unavailable | other 4xx the gateway answers about the target, not the content: 404, 405, 408, 409, `skill_error_404` |
 | system | delegate_failed | the A2A delegate's task ended FAILED / REJECTED / CANCELED |
+| system | delegate_deviated | the delegate's outcome, as the gateway checked it, is not `declared`, is missing, or is not one the agent handles (RFC 0025, DelegateDeviated) |
 | application | content_blocked | a content verdict: `guardrail_blocked`, `semantic_policy_blocked`, an argument-policy deny (`argument_policy`, JSON-RPC -32000) |
 | application | rejected_request | HTTP 400 / 413 / 422, `skill_error_400/413/422`: the request built from this application was refused |
 | application | tool_error | a tool answered with an error about this application (not found, invalid record, unknown class or verdict) |
@@ -50,7 +51,7 @@ from typing import Any
 
 import httpx
 
-from .gateway import ApprovalRequired, DelegateFailed, GatewayError, GatewayUnreachable, PolicyBlocked, ToolError
+from .gateway import ApprovalRequired, DelegateDeviated, DelegateFailed, GatewayError, GatewayUnreachable, PolicyBlocked, ToolError
 
 
 class FailureClass(StrEnum):
@@ -66,6 +67,7 @@ SYSTEM_KINDS: dict[str, str] = {
     "governance_refusal": "autonomy denied, run aborted, missing grant or access, bad credentials",
     "unavailable": "the gateway could not find or route the target (404, 405, 408, 409)",
     "delegate_failed": "the A2A delegate's task ended FAILED, REJECTED or CANCELED",
+    "delegate_deviated": "the A2A delegate answered with an outcome that is not declared, missing or not one the agent handles",
 }
 
 APPLICATION_KINDS: dict[str, str] = {
@@ -129,7 +131,7 @@ def _jsonrpc_policy_denied(body: Any) -> bool:
 
 def _classify(hint: str, status: int | None, text: str, body: Any = None) -> Failure:
     """The rules, in order. `hint` is the exception family: unreachable,
-    approval, delegate, policy, tool, gateway or other."""
+    approval, delegate, deviated, policy, tool, gateway or other."""
     low = text.lower()
     detail = text
     skill = SKILL_STATUS.search(low)
@@ -150,6 +152,8 @@ def _classify(hint: str, status: int | None, text: str, body: Any = None) -> Fai
         return _application("content_blocked", detail)
     if hint == "delegate":
         return _system("delegate_failed", detail)
+    if hint == "deviated":
+        return _system("delegate_deviated", detail)
 
     effective = status if status not in (None, 200) else skill_status
     if effective is not None:
@@ -191,6 +195,8 @@ def classify_failure(exc: BaseException) -> Failure:
         hint = "unreachable"
     elif isinstance(exc, ApprovalRequired):
         hint = "approval"
+    elif isinstance(exc, DelegateDeviated):
+        hint = "deviated"
     elif isinstance(exc, DelegateFailed):
         hint = "delegate"
     elif isinstance(exc, PolicyBlocked):
@@ -212,6 +218,7 @@ _REASON_HINTS = {
     "GatewayUnreachable": "unreachable",
     "ApprovalRequired": "approval",
     "DelegateFailed": "delegate",
+    "DelegateDeviated": "deviated",
     "PolicyBlocked": "policy",
     "ToolError": "tool",
     "GatewayError": "gateway",
@@ -222,8 +229,11 @@ def classify_reason(reason: str) -> Failure:
     """Classify a failure from its recorded text alone.
 
     Used for skip entries written before failures were classified (tracker
-    file v1), whose reason reads `<run state>: <ExcType>: <message>` or
-    `blocked_policy: blocked by policy: <body>`."""
+    file v1), whose reason reads `<run state>: <ExcType>: <message>` or, in
+    files written before RFC 0025 removed the terminal state,
+    `blocked_policy: blocked by policy: <body>` (still read: it is local state
+    on the agent's volume, not the wire). A block now reads
+    `errored: PolicyBlocked: blocked by policy: <body>`."""
     text = str(reason or "")
     state, _, rest = text.partition(": ")
     hint = "other"

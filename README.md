@@ -71,14 +71,14 @@ every node that calls the gateway gets a turn id.
 | 3 | `credit_report` | MCP `bureau_get_report` | Sensitive read, sealed as evidence |
 | 4 | `affordability` | Skills MCP `skills__run_script` | Deterministic policy; `unaffordable` forces `decline` |
 | 5 | `classify` | LLM `gpt-5.2`, JSON | `risk_band` low, medium, high |
-| 6 | `fraud_screen` | A2A outbound to the fraud screener | `hit` forces `decline`, `review` forces `refer` |
+| 6 | `fraud_screen` | A2A outbound to the fraud screener | `hit` forces `decline`, `review` forces `refer`; the verdict is the screener's declared outcome as the gateway checked it |
 | 7 | `decide` | LLM `gpt-5.5`, JSON | Recommendation, rationale, customer letter; hard rules override the model; letter carries the AI disclosure |
-| 8 | `record` | MCP `applications_set_recommendation` | Last action carries `X-Brutor-Run-End` and `X-Brutor-Run-Outcome` |
+| 8 | `record` | MCP `applications_set_recommendation` | Last action carries `X-Brutor-Run-End: completed` and `X-Brutor-Outcome-Id: application_processed.loan_approved` / `loan_rejected` / `loan_referred` |
 
 Human oversight: `applications_set_recommendation` is governed by an argument
 policy. A `decline`, or an `amount_eur` above 25,000, returns HTTP 202
 `approval_required`. The agent adds a note, stores the pending approval, ends
-the run `escalated`, and polls on later ticks. When an underwriter approves,
+the run `application_processed.held_for_underwriter`, and polls on later ticks. When an underwriter approves,
 the agent re-issues the identical call with the approval token in a short
 `apply_approved_decision` run. Expired holds are re-raised; a rejected one is
 handed off to manual review (`applications_hand_off`, status
@@ -94,9 +94,43 @@ abort is the system's: never counted, the tick stops and the agent backs off
 starve new ones (the pending listing pages on). `./demo.sh requeue` puts
 handed-off applications back in the queue.
 
-Terminal states: `completed` + `resolved` on the normal path, `completed` +
-`escalated` on a hold, `errored` if a node raises, `blocked_policy` on a
-guardrail or policy block. Nothing ends as `exhausted`: the graph has no loop.
+Terminal states: `completed` with a declared outcome on every path that did its
+job; `errored` if a node raises or a guardrail or policy blocks a call (the
+gateway records the cause, e.g. `blocked_by_policy`; `blocked_policy` is no
+longer a terminal state). A failed run reports no outcome. Nothing ends as
+`exhausted`: the graph has no loop.
+
+## Declared outcomes (RFC 0025)
+
+Each agent ships the catalogue of how its runs may end inside its package, and
+that one file is what the agent validates its `X-Brutor-Outcome-Id` against and
+what `setup.py` declares on the AI System (`PUT /v1/admin/ai-systems/{id}/outcomes`)
+before minting the contract:
+
+- **Screening agent** (`screening_agent/outcomes.json`): `application_processed`
+  (counts toward the operating baseline) with the variants `loan_approved`,
+  `loan_rejected`, `loan_referred` (the recorded recommendation),
+  `held_for_underwriter`, `underwriter_decision_applied`,
+  `underwriter_hold_renewed`, `underwriter_hold_closed` and
+  `sent_to_manual_review`; and two **no-work** outcomes that do not count:
+  `no_applications_available` (a tick with nothing to screen) and
+  `applications_dispatched` (a tick that found work and handed it to
+  per-application runs). An empty poll is therefore never read as a success of
+  the work, and does not dilute cost per processed outcome or the baselines.
+- **Fraud screener** (`fraud_screener/outcomes.json`): `screening_completed`
+  with `clear`, `review`, `hit`, returned on every A2A response as
+  `X-Brutor-Outcome-Id` and in the final Task's `metadata["brutor.outcome.id"]`.
+  The gateway checks it against the screener's contract and hands the caller
+  `X-Brutor-Outcome-Conformance`; the screening agent fails the run (like an
+  unreachable delegate) on anything but a `declared` outcome among the three it
+  expects, and branches on that checked value, not on the response body. Its
+  dependency edge declares the same three as `expected_outcomes`.
+
+The scheduler's tick is its own run (`bds-tick-<ulid>`), closed with one of the
+two no-work outcomes before any application is screened; each application is a
+run of its own. The one-day "poll-fold" of 2026-10-25 (the first application
+screened inside the tick run) is removed: declared no-work outcomes solve what
+it worked around. `X-Brutor-Run-Outcome` is gone.
 
 ## Governance configuration
 
@@ -213,7 +247,7 @@ manual review (status `needs_manual_review`, with a note), so it is not screened
 into a fresh hold again.
 
 
-1. Wait for a run to end `escalated` (the log line says "held for
+1. Wait for a run to end `application_processed.held_for_underwriter` (the log line says "held for
    underwriter, approval id ..."; `verify.py` lists pending approvals).
 2. User Portal (http://localhost:3001), log in as `underwriter` /
    `Underwriter123!` (created by `setup.py`; the credentials are in
@@ -230,8 +264,9 @@ into a fresh hold again.
 4. On its next tick the agent polls `GET /v1/portal/approvals/{id}/poll`,
    receives the one-time approval token, and re-issues the identical write
    with `X-Approval-Token` in a new short run (`apply_approved_decision`,
-   outcome `resolved`). A rejection produces a note on the application and
-   the recommendation is dropped. Approvals expire; an expired hold is
+   outcome `application_processed.underwriter_decision_applied`). A rejection
+   hands the application off to manual review (outcome
+   `application_processed.sent_to_manual_review`) and the recommendation is dropped. Approvals expire; an expired hold is
    treated as rejected.
 
 Nothing changes between what the underwriter saw and what is recorded: the

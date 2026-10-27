@@ -23,5 +23,9 @@ fraud-screener = "fraud_screener.__main__:main"
 [tool.setuptools.packages.find]
 include = ["fraud_screener*"]
 
+# The declared outcome catalogue (RFC 0025) ships inside the package.
+[tool.setuptools.package-data]
+fraud_screener = ["outcomes.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

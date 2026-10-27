@@ -9,7 +9,8 @@ Header contract (every call inside a run):
 
     Authorization        Bearer sk_brutor_api_...
     X-Tenant-ID          tenant id (the key resolves the tenant; sent anyway)
-    x-brutor-run-id      bds-<application_id>-<ulid>, identical on every call
+    x-brutor-run-id      bds-<application_id>-<ulid> (bds-tick-<ulid> for the scheduler's
+                         tick run), identical on every call
     X-Brutor-Turn-Id     one turn per node that calls the gateway
     X-Brutor-Turn-Seq    turn ordinal within the run (1, 2, 3, ...)
     X-Brutor-Step-Id     the node name (intake, verify_identity, ...)
@@ -28,10 +29,19 @@ MCP calls (tools, skills) also carry params._meta["io.modelcontextprotocol/clien
 Closing headers, only on the last call of the run:
 
     X-Brutor-Run-End     a literal terminal state, never "true"
-    X-Brutor-Run-Outcome resolved | escalated | handed_off | abandoned_by_user
+    X-Brutor-Outcome-Id  the declared outcome (RFC 0025), `<outcome>[.<variant>]`, validated
+                         here against the agent's own catalogue (outcomes.json) before
+                         the call is sent; completed runs only, errors are not outcomes
 
-The fallback close is POST /v1/runs/{root}/end, where root is the
-x-brutor-run-id RESPONSE header the gateway returns on LLM calls.
+The fallback close is POST /v1/runs/{root}/end with {"state", "outcome_id"}, where
+root is the x-brutor-run-id RESPONSE header the gateway returns on LLM calls.
+
+A2A delegation (RFC 0025 section 7a): the gateway checks the delegate's
+reported outcome against the delegate's contract and returns the checked pair
+as the response headers X-Brutor-Outcome-Id / X-Brutor-Outcome-Conformance
+and in the final Task's metadata (brutor.outcome.id / brutor.outcome.conformance).
+a2a_delegate() accepts only `declared` and, when given, an id from the
+dependency's expected outcomes; anything else raises DelegateDeviated.
 
 LLM calls use one of two OpenAI-shaped routes, chosen per model:
 
@@ -53,10 +63,11 @@ import secrets
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Collection, Iterator
 
 import httpx
 
+from . import outcomes
 from .config import Settings
 from .identity import MCP_CLIENT_INFO_META_KEY, AgentRelease, current_release
 
@@ -68,7 +79,10 @@ TURN_SEQ_HEADER = "X-Brutor-Turn-Seq"
 STEP_ID_HEADER = "X-Brutor-Step-Id"
 STEP_NAME_HEADER = "X-Brutor-Step-Name"
 RUN_END_HEADER = "X-Brutor-Run-End"
-RUN_OUTCOME_HEADER = "X-Brutor-Run-Outcome"
+OUTCOME_ID_HEADER = "X-Brutor-Outcome-Id"
+OUTCOME_CONFORMANCE_HEADER = "X-Brutor-Outcome-Conformance"
+OUTCOME_ID_META = "brutor.outcome.id"
+OUTCOME_CONFORMANCE_META = "brutor.outcome.conformance"
 APPROVAL_TOKEN_HEADER = "X-Approval-Token"
 TRACEPARENT_HEADER = "traceparent"
 
@@ -77,13 +91,16 @@ TERMINAL_STATES = frozenset(
         "completed",
         "completed_degraded",
         "errored",
-        "blocked_policy",
         "cancelled",
         "exhausted",
         "abandoned",
     }
 )
-OUTCOMES = frozenset({"resolved", "escalated", "handed_off", "abandoned_by_user"})
+# RFC 0025: the conformance values the gateway returns for a delegate's outcome.
+CONFORMANCE_VALUES = frozenset({"declared", "undeclared", "unreported"})
+# A declared outcome names what a run produced; a run that failed reports none
+# (RFC 0025 P2: errors are execution, not outcomes).
+OUTCOME_STATES = frozenset({"completed", "completed_degraded"})
 
 LLM_APIS = ("chat", "responses")
 RESPONSES_ONLY_MARKER = "only supports the responses endpoint"
@@ -128,7 +145,8 @@ class ApprovalRequired(GatewayError):
 
 
 class PolicyBlocked(GatewayError):
-    """HTTP 403 with a guardrail or policy body: the run ends blocked_policy."""
+    """HTTP 403 with a guardrail or policy body: the run ends errored (the
+    gateway records the error cause blocked_by_policy)."""
 
     def __init__(self, body: Any, *, status: int = 403):
         super().__init__(f"blocked by policy: {_short(body)}", status=status, body=body)
@@ -147,6 +165,27 @@ class GatewayUnreachable(GatewayError):
 
 class DelegateFailed(ToolError):
     """The A2A delegate answered, but its task ended FAILED / REJECTED / CANCELED."""
+
+
+class DelegateDeviated(DelegateFailed):
+    """The A2A delegate answered with an outcome the gateway did not judge
+    `declared` against the delegate's contract, reported none, or reported one
+    outside the outcomes this agent is built to handle (RFC 0025 section 7a).
+    The fraud check failed: the run errors, as with an unreachable delegate."""
+
+
+@dataclass(frozen=True)
+class DelegateAnswer:
+    """A delegate's answer as the gateway checked it: the verdict JSON from
+    the task's message, and the outcome id and its conformance."""
+
+    verdict: dict[str, Any]
+    outcome_id: str
+    conformance: str
+
+    @property
+    def variant(self) -> str:
+        return self.outcome_id.split(".", 1)[1] if "." in self.outcome_id else ""
 
 
 def _short(value: Any, limit: int = 200) -> str:
@@ -242,7 +281,7 @@ class Gateway:
         *,
         turn: tuple[str, int] | None = None,
         run_end: str | None = None,
-        outcome: str | None = None,
+        outcome_id: str | None = None,
         approval_token: str | None = None,
     ) -> dict[str, str]:
         """Build the per-call header set. Outside a run (ctx is None) only the
@@ -276,12 +315,12 @@ class Gateway:
                     f"X-Brutor-Run-End must be a literal terminal state, got {run_end!r}"
                 )
             h[RUN_END_HEADER] = run_end
-            if outcome is not None:
-                if outcome not in OUTCOMES:
-                    raise ValueError(f"unknown run outcome {outcome!r}")
-                h[RUN_OUTCOME_HEADER] = outcome
-        elif outcome is not None:
-            raise ValueError("X-Brutor-Run-Outcome is only kept alongside X-Brutor-Run-End")
+            if outcome_id is not None:
+                if run_end not in OUTCOME_STATES:
+                    raise ValueError(f"an outcome is reported on a completed run only, not {run_end!r}")
+                h[OUTCOME_ID_HEADER] = outcomes.validate(outcome_id)
+        elif outcome_id is not None:
+            raise ValueError("X-Brutor-Outcome-Id is only sent on the run-closing call, beside X-Brutor-Run-End")
 
         if approval_token:
             h[APPROVAL_TOKEN_HEADER] = approval_token
@@ -420,7 +459,7 @@ class Gateway:
         turn: tuple[str, int] | None = None,
         node: str | None = None,
         run_end: str | None = None,
-        outcome: str | None = None,
+        outcome_id: str | None = None,
     ) -> Any:
         """Model call through the gateway on the chat or the responses route.
 
@@ -434,7 +473,7 @@ class Gateway:
             raise ValueError(f"unknown LLM api {api!r}; expected one of {LLM_APIS}")
         if api == "chat" and model in self.responses_only:
             api = "responses"
-        hdr = self.headers(step_id, step_name, turn=turn, run_end=run_end, outcome=outcome)
+        hdr = self.headers(step_id, step_name, turn=turn, run_end=run_end, outcome_id=outcome_id)
         if api == "chat":
             try:
                 content = self._chat(model, messages, json, hdr, step_id, node)
@@ -567,12 +606,12 @@ class Gateway:
         turn: tuple[str, int] | None = None,
         node: str | None = None,
         run_end: str | None = None,
-        outcome: str | None = None,
+        outcome_id: str | None = None,
         approval_token: str | None = None,
     ) -> Any:
         """Raw JSON-RPC tools/call. Returns the parsed JSON from
         result.content[0].text when it parses, else the raw text."""
-        hdr = self.headers(step_id, step_name, turn=turn, run_end=run_end, outcome=outcome, approval_token=approval_token)
+        hdr = self.headers(step_id, step_name, turn=turn, run_end=run_end, outcome_id=outcome_id, approval_token=approval_token)
         hdr["Content-Type"] = "application/json"
         hdr["Accept"] = "application/json, text/event-stream"
         self._rpc_id += 1
@@ -640,18 +679,23 @@ class Gateway:
         capability: str,
         payload: dict[str, Any],
         *,
+        expected_outcomes: Collection[str] | None = None,
         step_id: str | None = None,
         step_name: str | None = None,
         turn: tuple[str, int] | None = None,
         node: str | None = None,
-        run_end: str | None = None,
-        outcome: str | None = None,
-    ) -> dict[str, Any]:
-        """Delegate to a remote agent via the outbound A2A proxy. Returns the
-        verdict JSON found in task.status.message.parts[0].text."""
+    ) -> DelegateAnswer:
+        """Delegate to a remote agent via the outbound A2A proxy.
+
+        Returns the verdict JSON found in task.status.message.parts[0].text with
+        the delegate's outcome as the gateway checked it. Raises DelegateFailed
+        when the task ended FAILED / REJECTED / CANCELED, and DelegateDeviated
+        when the checked outcome is not `declared`, is missing, or (with
+        `expected_outcomes`) is not one this agent is built to handle. Never
+        closes the run: a delegation is not the last action of a run."""
         import uuid
 
-        hdr = self.headers(step_id, step_name, turn=turn, run_end=run_end, outcome=outcome)
+        hdr = self.headers(step_id, step_name, turn=turn)
         hdr["Content-Type"] = "application/json"
         body = {
             "target_card_id": card_id,
@@ -671,7 +715,7 @@ class Gateway:
         self._log_call("a2a", capability, response.status_code, step_id, (time.monotonic() - started) * 1000, node)
         out = self._parse_body(response)
         self._raise_for_status(response, out)
-        self._note_response(response, run_end=run_end)
+        self._note_response(response, run_end=None)
         if not isinstance(out, dict):
             raise GatewayError(f"a2a: non-JSON response: {_short(out)}", body=out)
         task = out.get("task") or out.get("result") or {}
@@ -681,6 +725,20 @@ class Gateway:
         state = str(status.get("state", "")).upper()
         if "FAILED" in state or "REJECTED" in state or "CANCELED" in state or "CANCELLED" in state:
             raise DelegateFailed(f"a2a task ended {state}: {_short(status)}", body=out)
+        outcome_id, conformance = self._delegate_outcome(response, task, out)
+        if conformance != "declared":
+            raise DelegateDeviated(
+                f"a2a: the delegate's outcome {outcome_id!r} is {conformance or 'not judged by the gateway'} "
+                f"(X-Brutor-Outcome-Conformance), not declared",
+                body=out,
+            )
+        if outcome_id is None:
+            raise DelegateDeviated("a2a: the gateway judged the outcome declared but returned no outcome id", body=out)
+        if expected_outcomes is not None and outcome_id not in expected_outcomes:
+            raise DelegateDeviated(
+                f"a2a: the delegate answered {outcome_id!r}, not one of the outcomes this agent handles {sorted(expected_outcomes)}",
+                body=out,
+            )
         parts = (status.get("message") or {}).get("parts") or []
         text = ""
         for part in parts:
@@ -690,16 +748,43 @@ class Gateway:
         verdict = self._loads_tolerant(text) if text else None
         if not isinstance(verdict, dict):
             raise GatewayError(f"a2a: remote agent returned no JSON verdict: {_short(text or out)}", body=out)
-        return verdict
+        return DelegateAnswer(verdict=verdict, outcome_id=outcome_id, conformance=conformance)
+
+    @staticmethod
+    def _delegate_outcome(response: httpx.Response, task: dict[str, Any], out: Any) -> tuple[str | None, str | None]:
+        """The checked outcome (id, conformance) from the gateway's response
+        headers (sync) or the final Task's metadata (streamed / async). When
+        both carry a value they must agree; a disagreement is a deviation."""
+        meta = task.get("metadata")
+        meta = meta if isinstance(meta, dict) else {}
+
+        def pick(header: str, key: str) -> str | None:
+            h = (response.headers.get(header) or "").strip() or None
+            m = meta.get(key)
+            m = m.strip() if isinstance(m, str) and m.strip() else None
+            if h is not None and m is not None and h != m:
+                raise DelegateDeviated(f"a2a: {header} {h!r} disagrees with the task metadata {key} {m!r}", body=out)
+            return h if h is not None else m
+
+        outcome_id = pick(OUTCOME_ID_HEADER, OUTCOME_ID_META)
+        conformance = pick(OUTCOME_CONFORMANCE_HEADER, OUTCOME_CONFORMANCE_META)
+        if outcome_id is not None and not outcomes.OUTCOME_ID_RE.fullmatch(outcome_id):
+            raise DelegateDeviated(f"a2a: malformed delegate outcome id {outcome_id[:128]!r}", body=out)
+        if conformance is not None and conformance not in CONFORMANCE_VALUES:
+            raise DelegateDeviated(f"a2a: unknown outcome conformance {conformance[:32]!r}", body=out)
+        return outcome_id, conformance
 
     # -- run close and approvals -------------------------------------------------
-    def end_run(self, state: str, outcome: str | None) -> bool:
-        """Close the run via POST /v1/runs/{root}/end. Requires the derived root
-        captured from an earlier response; otherwise a warning and no-op."""
+    def end_run(self, state: str, outcome_id: str | None = None) -> bool:
+        """Close the run via POST /v1/runs/{root}/end with {"state", "outcome_id"}.
+        Requires the derived root captured from an earlier response; otherwise
+        a warning and no-op. `outcome_id` is validated like the header."""
         if state not in TERMINAL_STATES:
             raise ValueError(f"unknown terminal state {state!r}")
-        if outcome is not None and outcome not in OUTCOMES:
-            raise ValueError(f"unknown run outcome {outcome!r}")
+        if outcome_id is not None:
+            if state not in OUTCOME_STATES:
+                raise ValueError(f"an outcome is reported on a completed run only, not {state!r}")
+            outcomes.validate(outcome_id)
         ctx = self.ctx
         if ctx is None:
             log.warning("end_run(%s) called outside a run", state)
@@ -716,8 +801,8 @@ class Gateway:
             )
             return False
         body: dict[str, Any] = {"state": state}
-        if outcome:
-            body["outcome"] = outcome
+        if outcome_id is not None:
+            body["outcome_id"] = outcome_id
         hdr = self.headers()
         hdr["Content-Type"] = "application/json"
         started = time.monotonic()

@@ -17,6 +17,7 @@ import httpx
 from screening_agent.config import Settings
 from screening_agent.gateway import Gateway
 from screening_agent.identity import DISTRIBUTION, MCP_CLIENT_INFO_META_KEY
+from screening_agent.outcomes import OUTCOME_ID_RE, full_ids
 from screening_agent.prompts import DISCLOSURE
 
 SAMPLE_APPLICATION: dict[str, Any] = {
@@ -53,6 +54,13 @@ class Call:
     @property
     def run_id(self) -> str | None:
         return self.headers.get("x-brutor-run-id")
+
+    @property
+    def outcome_id(self) -> str | None:
+        """X-Brutor-Outcome-Id on a proxied call, or outcome_id in an /end body."""
+        if isinstance(self.body, dict) and self.kind == "run_end":
+            return self.body.get("outcome_id")
+        return self.headers.get("x-brutor-outcome-id")
 
     @property
     def tool(self) -> str | None:
@@ -111,6 +119,14 @@ class FakeGateway:
     block_tool: str | None = None  # tool name that answers 403
     fail_tool: str | None = None  # tool name that answers 500
     fail_a2a: bool = False
+    # How the gateway returns the fraud screener's checked outcome (RFC 0025 7a):
+    # "header" (sync), "metadata" (final Task), "both", or "none".
+    fraud_outcome_carrier: str = "header"
+    # The outcome the gateway hands back; None = screening_completed.<fraud_verdict>.
+    fraud_outcome_id: str | None = None
+    fraud_conformance: str | None = "declared"
+    # Overrides for one carrier only (to make header and metadata disagree).
+    fraud_metadata_override: dict[str, Any] | None = None
     approval_statuses: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_list: list[dict[str, Any]] | None = None
     # More origination records besides `application` (see add_application).
@@ -192,6 +208,13 @@ class FakeGateway:
         # RFC 0023: the agent names its implementation and release on every call.
         assert call.headers.get("x-brutor-agent-name") == DISTRIBUTION, "missing X-Brutor-Agent-Name"
         assert call.headers.get("x-brutor-agent-version"), "missing X-Brutor-Agent-Version"
+        # RFC 0025: the old outcome header is gone; the declared outcome rides
+        # only on the closing call and is one the agent's catalogue declares.
+        assert "x-brutor-run-outcome" not in call.headers, "X-Brutor-Run-Outcome was removed (RFC 0025)"
+        if call.outcome_id is not None:
+            assert OUTCOME_ID_RE.fullmatch(call.outcome_id) and call.outcome_id in full_ids(), call.outcome_id
+            if call.kind != "run_end":
+                assert call.headers.get("x-brutor-run-end") in ("completed", "completed_degraded"), "outcome without a completed close"
         path = request.url.path
         if path == "/v1/proxy/llm/chat/completions":
             return self._llm(body)
@@ -202,6 +225,7 @@ class FakeGateway:
         if path == "/v1/proxy/a2a/outbound":
             return self._a2a(body)
         if path.startswith("/v1/runs/") and path.endswith("/end"):
+            assert set(body or {}) <= {"state", "outcome_id"}, body
             self.run_ends.append({"root": path.split("/")[3], "body": body})
             return httpx.Response(200, json={"ok": True})
         if path.startswith("/v1/portal/approvals/") and path.endswith("/poll"):
@@ -374,6 +398,19 @@ class FakeGateway:
         assert "full_name" in payload and "bureau" in payload
         if self.fail_a2a:
             return httpx.Response(502, json={"error": "remote agent unreachable"})
+        outcome_id = self.fraud_outcome_id if self.fraud_outcome_id is not None else f"screening_completed.{self.fraud_verdict}"
+        checked = {"brutor.outcome.id": outcome_id, "brutor.outcome.conformance": self.fraud_conformance}
+        checked = {k: v for k, v in checked.items() if v is not None}
+        headers: dict[str, str] = {}
+        if self.fraud_outcome_carrier in ("header", "both"):
+            headers = {"x-brutor-outcome-id": outcome_id}
+            if self.fraud_conformance is not None:
+                headers["x-brutor-outcome-conformance"] = self.fraud_conformance
+        metadata: dict[str, Any] = {}
+        if self.fraud_outcome_carrier in ("metadata", "both"):
+            metadata = dict(checked)
+        if self.fraud_metadata_override:
+            metadata.update(self.fraud_metadata_override)
         verdict = {
             "verdict": self.fraud_verdict,
             "sanctions_match": self.fraud_verdict == "hit",
@@ -390,6 +427,8 @@ class FakeGateway:
                         "state": "TASK_STATE_COMPLETED",
                         "message": {"role": "ROLE_AGENT", "parts": [{"kind": "text", "text": json.dumps(verdict)}]},
                     },
+                    **({"metadata": metadata} if metadata else {}),
                 }
             },
+            headers=headers,
         )

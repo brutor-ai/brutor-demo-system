@@ -25,5 +25,9 @@ screening-agent = "screening_agent.__main__:main"
 [tool.setuptools.packages.find]
 include = ["screening_agent*"]
 
+# The declared outcome catalogue (RFC 0025) ships inside the package.
+[tool.setuptools.package-data]
+screening_agent = ["outcomes.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

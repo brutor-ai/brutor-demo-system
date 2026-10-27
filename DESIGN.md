@@ -116,8 +116,8 @@ node, which collapsed the three counts into one):
   distinct step and turn ids across all depths.
 
 A completed run therefore reads: 3 steps, 3 turns (two model passes of the screening
-agent plus one of the fraud screener), 9 actions. An escalated run adds the note action
-and reads 10 actions.
+agent plus one of the fraud screener), 9 actions. A run held for an underwriter adds the
+note action and reads 10 actions.
 
 | # | Node (step · turn) | Calls through the gateway | Notes |
 |---|---|---|---|
@@ -126,41 +126,63 @@ and reads 10 actions.
 | 3 | `credit_report` (gather · t1) | MCP `bureau_get_report` | Sensitive read (sealed as evidence because the system is flagged `sensitive_data`). |
 | 4 | `affordability` (gather · t1) | Skills MCP `skills__run_script` (`affordability-check` / `affordability.py`) | Deterministic policy; `unaffordable` forces `decline`. |
 | 5 | `classify` (assess · t1) | LLM, classifier model (`gpt-5.2`), JSON output | `risk_band` low/medium/high + key factors. |
-| 6 | `fraud_screen` (assess · t2) | A2A outbound to the Fraud & Sanctions Screener | `hit` forces `decline`, `review` forces `refer`. |
+| 6 | `fraud_screen` (assess · t2) | A2A outbound to the Fraud & Sanctions Screener | `hit` forces `decline`, `review` forces `refer`. The verdict is the variant of the screener's outcome as the gateway checked it (`screening_completed.<verdict>`, section 8, "Delegated outcomes"); anything but a declared, expected outcome fails the run. |
 | 7 | `decide` (decide · t2) | LLM, drafter model (`gpt-5.5`), JSON output | Recommendation approve/refer/decline, rationale, customer letter. Deterministic rules from steps 2, 4, 6 override the model. Letter must include the AI disclosure sentence. |
-| 8 | `record` (decide · t2) | MCP `applications_set_recommendation` (+ `applications_add_note` on approval hold) | The last action carries `X-Brutor-Run-End` and `X-Brutor-Run-Outcome`. |
+| 8 | `record` (decide · t2) | MCP `applications_set_recommendation` (+ `applications_add_note` on approval hold) | The last action carries `X-Brutor-Run-End: completed` and `X-Brutor-Outcome-Id: application_processed.<variant>` (section 8, "Declared outcomes"). |
 
 **Human oversight (Art 14).** `applications_set_recommendation` is governed by an
 argument policy: `recommendation == "decline"` or `amount_eur > 25000` returns HTTP 202
 `approval_required`. The agent then adds a note ("held for underwriter, approval id
 ..."), persists the pending approval to its data volume, and ends the run with
-`X-Brutor-Run-Outcome: escalated`. On every later tick it polls
+`X-Brutor-Outcome-Id: application_processed.held_for_underwriter`. On every later tick it polls
 `GET /v1/portal/approvals/{id}/poll` with its API key; when a human approves in the
 User Portal (Inbox → Approvals, as a member of the system's resource group; there is no
 Admin Console page, Compliance → Human Oversight only shows the tiles), the agent
 re-issues the identical call with
 `X-Approval-Token` in a new short run (`apply_approved_decision` step, outcome
-`resolved`). Expired approvals are re-raised (below). A rejected approval is handed off:
-`applications_hand_off` in its own short run (outcome `handed_off`) moves the
+`application_processed.underwriter_decision_applied`). Expired approvals are re-raised
+(below; outcome `application_processed.underwriter_hold_renewed`). A rejected approval is
+handed off: `applications_hand_off` in its own short run (outcome
+`application_processed.sent_to_manual_review`) moves the
 application to `needs_manual_review`, so it is not screened into a fresh hold on the
 next tick. An approved decision that cannot be applied is retried on later ticks; only
 application-class failures (below) count toward its three attempts, so an outage never
-drops a human's approval.
+drops a human's approval. When a hand-off or an approved decision cannot be done at all
+(hand-off refused, or the apply refused three times), a note records it in its own run
+(outcome `application_processed.underwriter_hold_closed`).
 
-**Terminal states.** `completed` + `resolved` on the normal path. `completed` +
-`escalated` on an approval hold. `errored` if a node raises (the agent closes the run
-via `POST /v1/runs/{root}/end` using the derived root from the `x-brutor-run-id`
-response header of its first LLM call, or via the header on its last successful call).
-A 403 guardrail or policy block ends the run `blocked_policy`. Nothing ever ends as
+**Terminal states.** `completed` with a declared outcome (section 8) on every path that
+did its job. `errored` if a node raises (the agent closes the run via
+`POST /v1/runs/{root}/end` `{"state": "errored"}` using the derived root from the
+`x-brutor-run-id` response header of its first LLM call; a run with no answered LLM call
+is left to the gateway, which sweeps it as `errored` because its last action failed).
+A 403 guardrail or policy block is also `errored`: since RFC 0025 `blocked_policy` is not
+a terminal state, and the gateway records the error cause `blocked_by_policy`. A failed
+run reports no outcome (errors are execution, not outcomes). Nothing ever ends as
 `exhausted` because the graph has no loop; the README says so.
 
 **Tick loop.** `TICK_SECONDS` (default 600). Each tick: resolve pending approvals,
 retry any hand-off that did not go through, list pending applications
-(`applications_list_pending`, each call sent as its own one-action run
-`bds-tick-<ulid>`, step `poll_pending`, closed on that same call with `completed` /
-`resolved`; an unattributed call would otherwise be minted a root by the gateway and
-swept as an `abandoned` run every tick, which skews the graded completion and
-abandoned rates), process up to `MAX_PER_TICK` (default 5) sequentially, oldest first.
+(`applications_list_pending`, in the tick's own run `bds-tick-<ulid>`, step
+`poll_pending`), process up to `MAX_PER_TICK` (default 5) sequentially, oldest first,
+each application in a run of its own (`bds-<id>-<ulid>`). The tick run is closed before
+any application is screened, on one more read-only listing call (`limit` 1) with
+`X-Brutor-Run-End: completed` and a declared outcome that does **not** count toward the
+operating baseline: `no_applications_available` when nothing is screenable,
+`applications_dispatched` when it found work (the work itself is counted in the
+application runs). The close has to ride on a call: MCP responses carry no derived root,
+so `/end` is not available to an MCP-only run, and an unclosed run would be swept as
+`abandoned` every tick. A listing that fails leaves the tick run with a failed last
+action and no close; the gateway sweeps it as `errored`, and the tick backs off.
+
+*Poll-fold, 2026-10-25 → removed 2026-10-26.* During a model outage every probe wrote a
+completed poll run beside an errored screening run, and the gateway counted the poll as
+a success, so health read *Degraded* instead of *Failing*. For one day the first
+application was screened inside the tick run to hide the poll. RFC 0025 fixed the cause
+instead: the poll's outcome is declared as no work, which the success rate, the down
+rule, cost per processed outcome and the baselines leave out, so the fold
+(`Gateway.resume`, `process_application(run=...)`) was removed and the tick is its own
+run again.
 First tick runs at start. `python -m screening_agent --once` processes one tick and exits.
 
 **No starvation.** Applications held for an underwriter and applications on the skip
@@ -168,8 +190,10 @@ list are excluded from the batch, but they can never fill it: the listing pages 
 cursor `after` (the last application id of the previous page; `LIST_LIMIT` rows per page,
 the server caps a page at 100, at most `LIST_MAX_PAGES` pages) until it has
 `MAX_PER_TICK` screenable applications or the pending set is exhausted. The first page's
-call is unchanged (`{"limit": N}`); further pages are further one-action tick runs, so
-they only appear when more than a page of held or skipped applications is waiting.
+call is unchanged (`{"limit": N}`); further pages are further actions of the same tick
+run, so they only appear when more than a page of held or skipped applications is
+waiting. (This is why the tick outcomes declare no `max_actions`: a tick takes
+`pages + 1` actions.)
 (Before 2026-09-28 the tick asked for one oldest-first page of
 `max(LIST_LIMIT, MAX_PER_TICK + skipped + held)`; the server caps pages at 100, so 100
 skipped applications starved every new one.)
@@ -186,6 +210,7 @@ skipped applications starved every new one.)
 | system | `governance_refusal` | `autonomy_denied: ...`, `run_aborted` / "run aborted by an operator", 401, a 403 without a content verdict (missing grant), `skill_error_401/403` |
 | system | `unavailable` | other 4xx about the target: 404, 405, 408, 409, `skill_error_404` |
 | system | `delegate_failed` | the A2A delegate's task ended FAILED / REJECTED / CANCELED |
+| system | `delegate_deviated` | the delegate's outcome, as the gateway checked it, is not `declared`, is missing, or is not one the agent handles (RFC 0025) |
 | application | `content_blocked` | a content verdict: `guardrail_blocked`, `semantic_policy_blocked`, an argument-policy deny (`argument_policy`, JSON-RPC -32000) |
 | application | `rejected_request` | 400 / 413 / 422, `skill_error_400/413/422` |
 | application | `tool_error` | a tool answered with an error about this application |
@@ -200,7 +225,8 @@ exception family.
 - **Application-class** failures count per application (`DATA_DIR/retries.json`). The
   application stays `received` and is retried next tick; after
   `MAX_ATTEMPTS_PER_APPLICATION` (3) the agent calls `applications_hand_off` in its own
-  short run `bds-<id>-giveup-<ulid>` (step `give_up`, `completed` / `handed_off`), which
+  short run `bds-<id>-giveup-<ulid>` (step `give_up`, `completed` /
+  `application_processed.sent_to_manual_review`), which
   sets the terminal status `needs_manual_review` with the reason as a note: the honest
   business outcome, and the application leaves the pending set. If the hand-off call
   fails, the application stays on the local skip list and the hand-off is retried at the
@@ -383,8 +409,11 @@ flag it, else `clear`.
 
 Response: `{"task": {"id", "contextId", "status": {"state": "TASK_STATE_COMPLETED",
 "message": {"role": "ROLE_AGENT", "parts": [{"kind": "text", "text": "<json
-verdict>"}]}}}}` where the verdict JSON is `{verdict, sanctions_match, reasons[],
-model_used}`.
+verdict>"}]}}, "metadata": {"brutor.outcome.id": "screening_completed.<verdict>"}}}`
+with the response header `X-Brutor-Outcome-Id: screening_completed.<verdict>`, where
+the verdict JSON is `{verdict, sanctions_match, reasons[], model_used}`. The outcome is
+declared in `fraud_screener/outcomes.json` (section 8, "Delegated outcomes"); a 400
+(no text part, invalid JSON) carries no outcome.
 
 Chain: it copies every inbound `x-brutor-delegation-*` header (root, parent, depth,
 sig, actor, subject) onto its LLM call, unchanged, and sends **no** `x-brutor-run-id`.
@@ -450,7 +479,7 @@ top_p is sent on any LLM call (gpt-5.x and Claude 4.8+ reject them).
 
 ```
 setup.py         idempotent REST provisioning (section 6), writes .demo.env
-verify.py        reads back health, runs, contract, gate, obligations, evidence, Annex IV doc, and (RFC 0023) each identity's declared implementation, the empty client labels and the latest observed release with its trust
+verify.py        reads back health, runs, contract, gate, obligations, evidence, Annex IV doc, (RFC 0023) each identity's declared implementation, the empty client labels and the latest observed release with its trust, and (RFC 0025) both stored outcome catalogues against the agents' outcomes.json and the dependency's expected_outcomes
 docker-compose.yml  the four containers on the external brutor-network, env_file .demo.env, a named volume for the agent's /data and the applications' /data
 demo.sh          up | provision | start | status | logs | down | run-one | generate | requeue
                  (orchestrates the order below; run-one screens one application, generate adds N,
@@ -551,7 +580,10 @@ the first unrecoverable error and says which step. Control plane at `CP_URL`
    **9b. Composition (RFC 0022).** `POST /v1/admin/ai-systems/{demo gid}/dependencies`
    `{"role": "shared_service", "depends_on_system_id": <fraud gid>, "agent_card_id":
    <fraud card id>, "criticality": "critical", "contributes_to_decision": true,
-   "contract_pin": null, "supplier_legal_entity": null}`. On re-runs the existing
+   "contract_pin": null, "supplier_legal_entity": null, "expected_outcomes":
+   ["screening_completed.clear", "screening_completed.hit", "screening_completed.review"]}`
+   (RFC 0025: the delegate outcomes the screening agent handles, read from its
+   `outcomes.json`; compared order-insensitively). On re-runs the existing
    edge is PATCHed only where it differs. No `supplier_legal_entity` (same legal
    entity) and no `assumptions` (they describe what a root assumes about a
    dependency it cannot test — an external agent; the screener is tested, from its
@@ -572,6 +604,15 @@ the first unrecoverable error and says which step. Control plane at `CP_URL`
    classified diff). Pinning a contract id instead keeps the Demo System from
    drifting and raises a `composition.dependency_pin_stale` finding when the
    screener moves on.
+   **9c. Declared outcomes (RFC 0025).** For the fraud screener, then the Demo System:
+   `GET /v1/admin/ai-systems/{gid}/outcomes`; when the stored catalogue differs from
+   the agent's `outcomes.json` (compared order-insensitively, ignoring echoed empty
+   fields), `PUT` `{"outcomes": [...]}` with the file's list verbatim, and fail if the
+   answer is not what was sent ("did not keep"). An unchanged re-run writes nothing, so
+   the contract does not drift. A 404 stops the script: a platform without declared
+   outcomes cannot judge the agent's outcomes, and there is no fallback. Step 14 mints
+   the contracts that capture the catalogues (closure section `outcomes`) and the
+   dependency's `expected_outcomes`.
 10. **Portal underwriter.** `POST /v1/admin/end-users` `underwriter` (`Underwriter123!`,
     display "Anna Berg (Underwriter)", `underwriter@borealis.example`,
     `send_welcome_email` false; 409 = exists), `POST /v1/admin/end-user-groups`
@@ -755,13 +796,68 @@ proxy routes and is not sent.
 **Run headers.** `x-brutor-run-id` (opaque, ≤128, identical on every call of the run,
 bound to the credential), `X-Brutor-Turn-Id` (≤64) + `X-Brutor-Turn-Seq`,
 `X-Brutor-Step-Id` (≤64) + `X-Brutor-Step-Name` (≤128), `traceparent`. Last call:
-`X-Brutor-Run-End: completed|completed_degraded|errored|blocked_policy|cancelled|
-exhausted|abandoned` (a literal, never `true`) and `X-Brutor-Run-Outcome:
-resolved|escalated|handed_off|abandoned_by_user` (only kept when Run-End is on the same
-request). Alternative close: `POST /v1/runs/{root}/end {"state","outcome"}` where root
-is the `x-brutor-run-id` **response** header of an LLM call (MCP/A2A/skill routes do
-not return it). Without a close the run is swept as `abandoned` after the system's
-idle window (300 s here).
+`X-Brutor-Run-End: completed|completed_degraded|errored|cancelled|exhausted|abandoned`
+(a literal, never `true`; `blocked_policy` is gone since RFC 0025) and, on a completed
+run, `X-Brutor-Outcome-Id: <outcome>[.<variant>]` (below). Alternative close:
+`POST /v1/runs/{root}/end {"state", "outcome_id"}` where root is the `x-brutor-run-id`
+**response** header of an LLM call (MCP/A2A/skill routes do not return it). Without a
+close the run is swept after the system's idle window (300 s here): `abandoned`, or
+`errored` when its last action failed. `X-Brutor-Run-Outcome` and its four fixed values
+(`resolved`, `escalated`, `handed_off`, `abandoned_by_user`) were removed by RFC 0025
+and are never sent (the fake gateway in the tests asserts their absence).
+
+**Declared outcomes (RFC 0025).** Each agent declares how its runs may end in a
+catalogue that ships **inside its package** and is the single source for both the
+agent's own validation and the setup's declaration:
+`brutor-demo-screening-agent/screening_agent/outcomes.json` and
+`brutor-demo-fraud-screener-agent/fraud_screener/outcomes.json`. `setup.py` PUTs each
+`outcomes` list as the AI System's catalogue (`PUT /v1/admin/ai-systems/{id}/outcomes`),
+the contract minted in step 14 captures it, and the gateway judges every reported id
+against the **active** contract: `declared`, `undeclared` or `unreported`. Only a
+completed run with a declared outcome that counts toward the baseline is a success; a
+declared no-work outcome is left out of the success rate, the down rule, cost per
+processed outcome and the baselines; every errored run counts against the rate.
+
+| Outcome id | Counts | Sent by | Evidence (`expect`) |
+|---|---|---|---|
+| `application_processed.loan_approved` / `loan_rejected` / `loan_referred` | yes | `record`, from the final recommendation `approve` / `decline` / `refer` | requires `applications_set_recommendation` |
+| `application_processed.held_for_underwriter` | yes | `record`, the hold note after a 202 | requires `applications_add_note` |
+| `application_processed.underwriter_decision_applied` | yes | approvals: the approved decision applied with its token | ≤ 2 actions, 0 model calls |
+| `application_processed.underwriter_hold_renewed` | yes | approvals: a lapsed hold re-raised with the identical call | ≤ 2 actions, 0 model calls, requires `applications_set_recommendation` |
+| `application_processed.underwriter_hold_closed` | yes | approvals: a note when the hand-off or the apply could not be done | 0 model calls, requires `applications_add_note` |
+| `application_processed.sent_to_manual_review` | yes | approvals (rejected, or lapsed past `RERAISE_MAX`) and the scheduler's give-up hand-off | 0 model calls, requires `applications_hand_off` |
+| `no_applications_available` | **no** | the tick, nothing screenable | 0 model calls, $0, no write tool |
+| `applications_dispatched` | **no** | the tick, work found and handed to per-application runs | 0 model calls, $0, no write tool |
+
+The tick outcomes declare no `max_actions`: a tick pages (`LIST_MAX_PAGES`) and then
+closes, so it legitimately takes `pages + 1` actions. The agent validates every id it
+sends (grammar `^[a-z0-9_-]{1,48}(\.[a-z0-9_-]{1,48})?$`, and membership in its own
+catalogue; an outcome with variants is never sent bare) and raises before the call on
+anything else; an outcome is only sent with `X-Brutor-Run-End: completed`. A failed run
+sends none. A test walks every exit of the graph, the approvals and the scheduler
+against the shipped file: each reports a declared id, every declared id is reached, and
+each exit's run satisfies its variant's `expect`. To change the catalogue: edit the
+file, re-run `setup.py` (it PUTs only when the stored catalogue differs), and the new
+contract version is minted, approved and promoted like any other contract change.
+
+**Delegated outcomes (RFC 0025 section 7a).** The fraud screener declares
+`screening_completed` with variants `clear`, `review`, `hit`, and reports
+`screening_completed.<verdict>` on every completed task twice: the response header
+`X-Brutor-Outcome-Id` (sync) and the final Task's `metadata["brutor.outcome.id"]`
+(streamed / async). It never claims its own conformance. The gateway checks the value
+against the **screener's** active contract and returns the checked pair to the caller:
+`X-Brutor-Outcome-Id` + `X-Brutor-Outcome-Conformance: declared|undeclared|unreported`
+and the same pair in the final Task's metadata (`brutor.outcome.id`,
+`brutor.outcome.conformance`). The screening agent reads either carrier (when both are
+present they must agree) and accepts only `declared` and an id among the dependency's
+`expected_outcomes` (the three verdicts, declared from the screening agent's
+`outcomes.json` on the dependency edge, so an answer outside them is also an
+`unexpected_delegate_outcome` finding on the demo system). Anything else — undeclared,
+unreported, no conformance at all, a disagreement between carriers, a malformed id, an
+unexpected outcome — raises `DelegateDeviated`: the fraud check failed, the run errors
+like an unreachable delegate (system class `delegate_deviated`, the scheduler backs
+off; the gateway records the cause `delegate_deviated`). The verdict the graph branches
+on is the checked outcome's variant, never the body's `verdict` field.
 
 **Delegation chain.** When the gateway calls the fraud agent it sends
 `x-brutor-delegation-root|parent|depth|sig` and, because the caller is an agent
@@ -844,9 +940,22 @@ identical call with `X-Approval-Token`. One-time token.
   2026-09-27/28) and fails when a kind has no case or no row in the table;
   `tests/test_scheduler.py`: system failures never skip and back off on the documented
   schedule, application failures hand off after three, a full page of held and skipped
-  applications does not starve new ones, re-queueing, v1 tracker migration.
+  applications does not starve new ones, re-queueing, v1 tracker migration, the tick as
+  its own run (a failing listing leaves the tick run errored, an empty poll reports
+  `no_applications_available`, a poll that found work `applications_dispatched` and
+  closes before the screening starts, an outage probe is a no-work poll beside a failed
+  screening). `tests/test_outcomes.py` (RFC 0025): the shipped catalogue is a valid
+  document with exactly the hand-listed ids; every exit of the graph, the approvals and
+  the scheduler sends a declared id, every declared id is reached, failed runs send
+  none, and each exit's run satisfies its variant's `expect`; the delegate's checked
+  outcome decides the fraud verdict (header, metadata, both), and undeclared,
+  unreported, unjudged, unexpected, malformed and disagreeing outcomes fail the run as
+  `delegate_deviated`. `tests/test_headers.py`: `X-Brutor-Outcome-Id` grammar and
+  catalogue membership refused client-side, only beside a completed close, the `/end`
+  body `{"state", "outcome_id"}`, and `X-Brutor-Run-Outcome` never sent.
 - Fraud agent: card served, both `message:send` spellings, chain headers echoed,
-  sanctions hit → `hit`.
+  sanctions hit → `hit`; every completed task carries `screening_completed.<verdict>`
+  on the response header and in the Task metadata, for each verdict.
 - Agent release (both agents, `tests/test_identity.py`): the header names and the MCP
   `_meta` key are pinned; every call type carries name and version (the screening
   agent's fake gateway asserts it on every request, and clientInfo on every MCP call);
@@ -859,7 +968,13 @@ identical call with `X-Approval-Token`. One-time token.
   what differs; the fallback card's version is the pyproject version; a new release
   PATCHes the card body and version and re-signs; `verify.py` passes a declared demo,
   warns while no release is observed, and fails on a differing declaration, non-empty
-  client labels, or an unapproved or misnamed current release.
+  client labels, or an unapproved or misnamed current release. RFC 0025: both catalogues
+  are the agents' files verbatim and the screening agent expects exactly the
+  screener's declared ids; step 9c PUTs only what differs (order and echoed defaults
+  ignored), fails on a catalogue not kept and on a platform without the endpoint, and
+  runs before the contracts are minted; the dependency edge carries
+  `expected_outcomes` on create and is PATCHed only when they differ; `verify.py` reads
+  both back.
 - `setup.py --dry-run` prints the plan without calling anything.
 - End-to-end (needs the trial stack): `demo.sh up`, wait one tick, `verify.py`
   expects ≥1 run with `chain_integrity` intact/client_asserted, `step_count` 8,

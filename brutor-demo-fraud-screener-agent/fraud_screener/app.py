@@ -16,6 +16,7 @@ from starlette.routing import Route
 from .config import Settings
 from .identity import AgentRelease, current_release
 from .llm import DELEGATION_PREFIX, fraud_indicators
+from .outcomes import OUTCOME_ID_HEADER, OUTCOME_ID_META, outcome_for
 from .screening import verdict_for
 
 log = logging.getLogger("fraud_screener.app")
@@ -97,7 +98,9 @@ def parse_payload(text: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {"purpose": text}
 
 
-def task_response(verdict: dict[str, Any], *, state: str = "TASK_STATE_COMPLETED") -> dict[str, Any]:
+def task_response(verdict: dict[str, Any], *, outcome_id: str, state: str = "TASK_STATE_COMPLETED") -> dict[str, Any]:
+    """The final Task. Its metadata carries the declared outcome (RFC 0025
+    section 7a), the carrier the gateway reads for a streamed or async task."""
     return {
         "task": {
             "id": str(uuid.uuid4()),
@@ -110,6 +113,7 @@ def task_response(verdict: dict[str, Any], *, state: str = "TASK_STATE_COMPLETED
                     "parts": [{"kind": "text", "text": json.dumps(verdict)}],
                 },
             },
+            "metadata": {OUTCOME_ID_META: outcome_id},
         }
     }
 
@@ -152,8 +156,9 @@ def create_app(
         llm_result, llm_error = await fraud_indicators(settings, payload, request.headers, release, client=http_client)
         model_used = settings.classifier_model if llm_result is not None else None
         verdict = verdict_for(payload, llm_result, llm_error, model_used)
+        outcome_id = outcome_for(verdict["verdict"])
         log.info(
-            "message:send correlation=%s depth=%s chain=%s applicant=%s verdict=%s sanctions=%s model=%s",
+            "message:send correlation=%s depth=%s chain=%s applicant=%s verdict=%s sanctions=%s model=%s outcome=%s",
             correlation,
             depth,
             "yes" if chain_present else "no",
@@ -161,8 +166,10 @@ def create_app(
             verdict["verdict"],
             verdict["sanctions_match"],
             model_used or "heuristics-only",
+            outcome_id,
         )
-        return JSONResponse(task_response(verdict))
+        # The same outcome on the response header (the synchronous carrier).
+        return JSONResponse(task_response(verdict, outcome_id=outcome_id), headers={OUTCOME_ID_HEADER: outcome_id})
 
     routes = [
         Route("/health", health, methods=["GET"]),

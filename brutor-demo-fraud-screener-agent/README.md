@@ -66,8 +66,24 @@ Response, exactly:
 {"task": {"id": "<uuid>", "contextId": "<uuid>",
   "status": {"state": "TASK_STATE_COMPLETED",
     "message": {"messageId": "<uuid>", "role": "ROLE_AGENT",
-      "parts": [{"kind": "text", "text": "{\"verdict\": \"clear\", \"sanctions_match\": false, \"reasons\": [\"...\"], \"model_used\": \"gpt-5.2\"}"}]}}}}
+      "parts": [{"kind": "text", "text": "{\"verdict\": \"clear\", \"sanctions_match\": false, \"reasons\": [\"...\"], \"model_used\": \"gpt-5.2\"}"}]}},
+  "metadata": {"brutor.outcome.id": "screening_completed.clear"}}}
 ```
+
+with the response header `X-Brutor-Outcome-Id: screening_completed.clear`.
+
+## Declared outcome (RFC 0025)
+
+`fraud_screener/outcomes.json` declares how a screening may end: `screening_completed`
+(counts toward the operating baseline) with the variants `clear`, `review` and `hit`,
+one per verdict. `brutor-demo-setup` PUTs it as the Fraud Screener AI System's
+catalogue. Every completed task reports `screening_completed.<verdict>` on both
+carriers the gateway reads — the `X-Brutor-Outcome-Id` response header (synchronous
+calls) and the final Task's `metadata["brutor.outcome.id"]` (streamed or async tasks) —
+and a verdict the catalogue does not declare is never sent (`outcomes.outcome_for`
+raises). The screener never states its own conformance: the gateway checks the value
+against this system's active contract and hands the caller the checked id with
+`X-Brutor-Outcome-Conformance`. A 400 (no text part, invalid JSON) carries no outcome.
 
 ## The delegation echo rule
 

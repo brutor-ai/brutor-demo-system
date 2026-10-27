@@ -8,7 +8,9 @@ section 9 against the most recent runs. It also reads back the agents'
 implementation identity (RFC 0023): each identity's declared implementation
 name, approved versions and require_release as setup.py declares them, the
 demo system's empty intended_client_labels, and the latest release the
-gateway observed per identity with its trust.
+gateway observed per identity with its trust. And the declared outcomes
+(RFC 0025): each AI System's stored catalogue against its agent's
+outcomes.json, and the dependency's expected_outcomes.
 
 Usage:
     python verify.py                 full report, exit 1 if an expectation fails
@@ -36,7 +38,8 @@ sys.path.insert(0, HERE)
 from setup import (  # noqa: E402  (shares the client and config with setup.py)
     ADMIN_PASSWORD, ADMIN_USER, CP_URL, DEMO_SYSTEM_NAME, FRAUD_DIST, FRAUD_IDENTITY,
     FRAUD_SYSTEM_NAME, GW_URL, SCREENING_DIST, SCREENING_IDENTITY, TENANT_ID, Client,
-    StepError, find, implementation_declaration, listing, read_demo_env,
+    StepError, _stored_catalogue, expected_delegate_outcomes, find, implementation_declaration, listing,
+    normalize_catalogue, outcome_catalogue, read_demo_env,
 )
 
 # (label, identity name, component distribution) per agent (RFC 0023).
@@ -47,7 +50,7 @@ AGENT_RELEASES = (
 
 # A full run declares 3 steps (gather, assess, decide) and 3 turns (t1 and t2
 # of the screening agent plus the fraud screener's own turn at depth 1, which
-# declares no step) over 9 actions (10 when escalated: the note): llm 3, a2a 1,
+# declares no step) over 9 actions (10 when held for an underwriter: the note): llm 3, a2a 1,
 # skill 1, tools 4 (DESIGN.md section 4). Runs recorded before the 2026-09-24
 # granularity fix declared one step per node (8 or 9), so completeness is
 # judged as step_count >= EXPECT_STEPS.
@@ -143,6 +146,30 @@ def check_agent_releases(cp: Client, rep: "Report", gid: str) -> None:
                        f"runs={r.get('run_count')} first_seen={r.get('first_seen_at')}")
 
 
+def check_declared_outcomes(cp: Client, rep: "Report", gid: str, fraud_gid: Optional[str]) -> None:
+    """RFC 0025 read-back: the stored catalogues are the agents' outcomes.json
+    files, and the demo system's dependency on the fraud screener expects
+    exactly the screener's three verdicts."""
+    cp.step = "outcomes"
+    for label, sys_gid, dist in (("demo", gid, SCREENING_DIST), ("fraud", fraud_gid, FRAUD_DIST)):
+        if not sys_gid:
+            rep.line(f"outcomes.{label}", "AI System not found; run setup.py", False)
+            continue
+        status, resp = cp.get(f"/v1/admin/ai-systems/{sys_gid}/outcomes", tolerate=(404,))
+        if status == 404:
+            rep.line(f"outcomes.{label}", "no outcomes endpoint (platform predates RFC 0025)", False)
+            continue
+        have = normalize_catalogue(_stored_catalogue(resp))
+        same = have == normalize_catalogue(outcome_catalogue(dist))
+        rep.line(f"outcomes.{label}", f"{len(have)} outcome(s) declared"
+                                      + ("" if same else f"; differs from {dist}'s outcomes.json, re-run setup.py"), same)
+    _, deps = cp.get(f"/v1/admin/ai-systems/{gid}/dependencies", tolerate=(404,))
+    edge = find(listing(deps, "dependencies"), depends_on_system_id=fraud_gid) if fraud_gid else None
+    want = expected_delegate_outcomes(SCREENING_DIST, FRAUD_DIST)
+    have_expected = sorted((edge or {}).get("expected_outcomes") or [])
+    rep.line("outcomes.dependency", f"expected_outcomes={have_expected}", bool(edge) and have_expected == want)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Read back the Brutor Demo System's surfaces.")
     ap.add_argument("--brief", action="store_true", help="one line per surface")
@@ -235,9 +262,10 @@ def main() -> int:
         turns = r.get("turn_count") if r.get("turn_count") is not None else d.get("turn_count")
         actions = r.get("action_count") if r.get("action_count") is not None else d.get("action_count")
         turns_ok = turns is None or turns >= EXPECT_TURNS
-        actions_ok = actions is None or actions >= EXPECT_ACTIONS  # 9 resolved, 10 escalated
+        actions_ok = actions is None or actions >= EXPECT_ACTIONS  # 9 recorded, 10 held
         good = (chain in GOOD_CHAIN and llm >= 3 and skill_ok and (a2a is None or a2a == 1) and turns_ok and actions_ok)
-        rep.line("run", f"{r['id']} state={r.get('terminal_state')} outcome={r.get('client_outcome')} "
+        rep.line("run", f"{r['id']} state={r.get('terminal_state')} outcome={r.get('outcome_id')} "
+                        f"conformance={r.get('outcome_conformance')} "
                         f"steps={r.get('step_count')} turns={turns} actions={actions} llm={llm} skill={skill} tools={tools} a2a={a2a} "
                         f"chain={chain} cost={r.get('total_cost_usd')}{skill_note}", good)
         checked = True
@@ -328,6 +356,7 @@ def main() -> int:
         rep.line("documentation", "not readable", None)
 
     check_agent_releases(cp, rep, gid)
+    check_declared_outcomes(cp, rep, gid, fraud_gid)
 
     if fraud_gid:
         _, fl = cp.get(f"/v1/admin/ai-systems/{fraud_gid}/lifecycle", tolerate=(404,))

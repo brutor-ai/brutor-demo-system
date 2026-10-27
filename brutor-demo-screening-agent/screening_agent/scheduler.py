@@ -1,10 +1,22 @@
 """Tick loop and health server (DESIGN.md section 4, "Tick loop").
 
 Each tick: resolve pending approvals, retry any hand-off that did not go
-through, list pending applications (each listing call is its own short run
-`bds-tick-<ulid>`, step `poll_pending`, closed on that same call so the ledger
-never sees an abandoned one-call run), and process up to MAX_PER_TICK
+through, list pending applications and process up to MAX_PER_TICK
 sequentially, oldest first.
+
+The listing is the tick's own run `bds-tick-<ulid>` (step `poll_pending`):
+its listing pages, then one more read-only `applications_list_pending`
+(`limit` 1) that closes it `completed` with a declared outcome (RFC 0025) —
+`no_applications_available` when nothing is screenable, else
+`applications_dispatched`. Neither counts toward the operating baseline, so an
+empty poll is never read as a success of the work. The tick run is closed
+before any application is screened; each application gets a run of its own.
+MCP responses carry no derived root, so the close has to ride on a call; an
+unclosed tick run would be swept as `abandoned`. A listing that fails leaves
+the tick run with a failed last action: the gateway sweeps it as `errored`.
+(From 2026-10-25 to 2026-10-26 the first application was screened inside the
+tick run, so an outage probe would not write a completed poll beside an
+errored screening; RFC 0025 made that fold unnecessary and it was removed.)
 
 Failures are classified by failures.py:
 
@@ -41,6 +53,7 @@ from .config import Settings
 from .failures import Failure, classify_failure, classify_reason
 from .gateway import Gateway, GatewayError, new_ulid
 from .graph import build_graph, process_application
+from .outcomes import APPLICATIONS_DISPATCHED, HELD_FOR_UNDERWRITER, NO_APPLICATIONS_AVAILABLE
 
 log = logging.getLogger("screening_agent.scheduler")
 
@@ -287,32 +300,36 @@ class Scheduler:
         }
 
     # -- listing ----------------------------------------------------------------
-    def list_pending(self, limit: int, after: str | None = None) -> list[dict[str, Any]]:
-        """applications_list_pending in its own short run, closed on the same call.
+    def list_pending(self, limit: int, after: str | None = None, *, outcome_id: str | None = None) -> list[dict[str, Any]]:
+        """applications_list_pending inside the open tick run (step poll_pending).
 
-        A proxied call without run headers makes the gateway mint a root that
-        the idle sweeper later closes as `abandoned`, which would skew the
-        completion and abandoned rates the envelope grades. So each listing
-        call is one tiny run: bds-tick-<ulid>, step poll_pending, turn 1,
-        X-Brutor-Run-End: completed, X-Brutor-Run-Outcome: resolved. `after`
-        (the last application id of the previous page) is sent only when
-        paging, so the first page's call is unchanged."""
-        assert self.gw.ctx is None, "listing must not run inside an application run"
+        Never outside a run: a proxied call without run headers makes the
+        gateway mint a root that the idle sweeper later closes as `abandoned`,
+        which would skew the completion and abandoned rates the envelope
+        grades. `outcome_id` closes the tick run on this call:
+        X-Brutor-Run-End: completed + X-Brutor-Outcome-Id. `after` (the last
+        application id of the previous page) is sent only when paging, so the
+        first page's call is unchanged."""
+        ctx = self.gw.ctx
+        assert ctx is not None and ctx.run_id.startswith("bds-tick-"), "listing runs inside the tick run"
         args: dict[str, Any] = {"limit": limit}
         if after:
             args["after"] = after
-        run_id = f"bds-tick-{new_ulid()}"
-        with self.gw.run(run_id):
-            out = self.gw.mcp_call(
-                self.settings.applications_mcp_server_id,
-                "applications_list_pending",
-                args,
-                step_id="poll_pending",
-                step_name="Tick: poll pending applications",
-                run_end="completed",
-                outcome="resolved",
-            )
-        log.info("run=%s state=completed outcome=resolved tick_poll=1%s", run_id, f" after={after}" if after else "")
+        out = self.gw.mcp_call(
+            self.settings.applications_mcp_server_id,
+            "applications_list_pending",
+            args,
+            step_id="poll_pending",
+            step_name="Tick: poll pending applications",
+            run_end="completed" if outcome_id else None,
+            outcome_id=outcome_id,
+        )
+        log.info(
+            "run=%s tick_poll=1%s%s",
+            ctx.run_id,
+            f" after={after}" if after else "",
+            f" state=completed outcome={outcome_id}" if outcome_id else "",
+        )
         if isinstance(out, dict):
             out = out.get("applications") or out.get("items") or []
         if not isinstance(out, list):
@@ -436,6 +453,34 @@ class Scheduler:
         self.status["skipped_applications"] = len(self.tracker.skipped())
         self.status["awaiting_hand_off"] = len(self.tracker.awaiting_hand_off())
 
+    def _poll(self, held: set[str], summary: dict[str, Any]) -> list[str]:
+        """The tick's own run: list, pick what to screen, close the run.
+
+        Returns the application ids to screen this tick (up to MAX_PER_TICK,
+        oldest first, the application that tripped the last backoff last). The
+        run is closed on one more read-only listing call with
+        `no_applications_available` or `applications_dispatched`. Any failure
+        propagates (the tick fails; the run keeps its failed last action and
+        the gateway sweeps it as errored)."""
+        with self.gw.run(f"bds-tick-{new_ulid()}"):
+            eligible, listed = self._screenable(held, summary)
+            if self._probe_last in eligible:
+                # The application that tripped the backoff goes last in the
+                # probe, so a failure misclassified as the system's cannot
+                # keep the rest of the queue waiting behind it.
+                eligible.remove(self._probe_last)
+                eligible.append(self._probe_last)
+            self._probe_last = None
+            todo = eligible[: self.settings.max_per_tick]
+            log.info(
+                "tick %d: %d pending listed, %d to process, %d held for underwriter (%d in store), %d skipped, %d released",
+                self.status["ticks"] + 1, listed, len(todo), len(summary["held"]), len(held), len(summary["skipped"]), len(summary["released"]),
+            )
+            outcome_id = APPLICATIONS_DISPATCHED if todo else NO_APPLICATIONS_AVAILABLE
+            self.list_pending(1, outcome_id=outcome_id)
+            summary["tick_outcome"] = outcome_id
+        return todo
+
     # -- one application --------------------------------------------------------
     def process_one(self, application_id: str):
         result = process_application(self.gw, self.settings, self.store, application_id, graph=self.graph)
@@ -443,12 +488,12 @@ class Scheduler:
         if result.state == "completed":
             self.tracker.clear(application_id)
             self._answered()
-            if result.outcome == "escalated":
+            if result.outcome == HELD_FOR_UNDERWRITER:
                 self.status["runs_escalated"] += 1
             else:
                 self.status["runs_completed"] += 1
         else:
-            if result.state == "blocked_policy":
+            if result.blocked_by_policy:
                 self.status["runs_blocked"] += 1
             else:
                 self.status["runs_errored"] += 1
@@ -519,19 +564,7 @@ class Scheduler:
 
             held = self.store.application_ids()
             self.status["held_applications"] = len(held)
-            eligible, listed = self._screenable(held, summary)
-            if self._probe_last in eligible:
-                # The application that tripped the backoff goes last in the
-                # probe, so a failure misclassified as the system's cannot
-                # keep the rest of the queue waiting behind it.
-                eligible.remove(self._probe_last)
-                eligible.append(self._probe_last)
-            self._probe_last = None
-            todo = eligible[: self.settings.max_per_tick]
-            log.info(
-                "tick %d: %d pending listed, %d to process, %d held for underwriter (%d in store), %d skipped, %d released",
-                self.status["ticks"] + 1, listed, len(todo), len(summary["held"]), len(held), len(summary["skipped"]), len(summary["released"]),
-            )
+            todo = self._poll(held, summary)
             for app_id in todo:
                 if self.stop_event.is_set():
                     break

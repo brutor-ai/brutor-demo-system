@@ -401,6 +401,72 @@ def plus_days_iso(days: int) -> str:
         microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+# --------------------------------------------------------------------------- #
+# Declared outcomes (RFC 0025): the agents' own catalogue files are the source
+# --------------------------------------------------------------------------- #
+OUTCOME_FILES = {
+    SCREENING_DIST: os.path.join(SYSTEM_ROOT, SCREENING_DIST, "screening_agent", "outcomes.json"),
+    FRAUD_DIST: os.path.join(SYSTEM_ROOT, FRAUD_DIST, "fraud_screener", "outcomes.json"),
+}
+
+
+def outcome_document(dist: str) -> Dict[str, Any]:
+    """The agent package's outcomes.json: {"outcomes": [...], "dependencies"?: [...]}.
+    The same file the agent validates what it sends against."""
+    with open(OUTCOME_FILES[dist], encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict) or not isinstance(doc.get("outcomes"), list) or not doc["outcomes"]:
+        raise ValueError(f"{OUTCOME_FILES[dist]}: expected a non-empty \"outcomes\" list")
+    return doc
+
+
+def outcome_catalogue(dist: str) -> List[Dict[str, Any]]:
+    """The catalogue PUT for the agent's AI System (spec section 5), verbatim."""
+    return outcome_document(dist)["outcomes"]
+
+
+def expected_delegate_outcomes(caller: str, delegate: str) -> List[str]:
+    """The dependency's expected_outcomes, sorted, from the caller's file."""
+    for dep in outcome_document(caller).get("dependencies") or []:
+        if dep.get("delegate") == delegate:
+            return sorted(dep.get("expected_outcomes") or [])
+    raise ValueError(f"{OUTCOME_FILES[caller]}: no dependency on {delegate}")
+
+
+def _drop_empty(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _drop_empty(v) for k, v in value.items() if v not in (None, "", [], {})}
+    return value
+
+
+def normalize_catalogue(catalogue: Any) -> List[Dict[str, Any]]:
+    """Order- and default-insensitive form for comparing the stored catalogue
+    with the file: outcomes and variants sorted by id, capability lists sorted,
+    empty optional fields dropped (the control plane may echo them as null)."""
+    out = []
+    for outcome in catalogue if isinstance(catalogue, list) else []:
+        if not isinstance(outcome, dict):
+            continue
+        o = _drop_empty(dict(outcome))
+        if isinstance(o.get("expect"), dict):
+            o["expect"] = {k: sorted(v) if isinstance(v, list) else v for k, v in o["expect"].items()}
+        variants = []
+        for v in o.get("variants") or []:
+            v = _drop_empty(dict(v))
+            if isinstance(v.get("expect"), dict):
+                v["expect"] = {k: sorted(x) if isinstance(x, list) else x for k, x in v["expect"].items()}
+            variants.append(v)
+        if variants:
+            o["variants"] = sorted(variants, key=lambda v: v.get("id", ""))
+        out.append(o)
+    return sorted(out, key=lambda o: o.get("id", ""))
+
+
+def _stored_catalogue(resp: Any) -> Any:
+    """GET/PUT .../outcomes answer {"ai_system_id", "outcomes"}; a bare list is tolerated."""
+    return resp.get("outcomes") if isinstance(resp, dict) else resp
+
+
 def implementation_declaration(dist: str) -> Dict[str, Any]:
     """The identity's implementation fields (RFC 0023 section 5.3): the name the
     software must declare, the one approved version (the current release), and
@@ -1056,6 +1122,10 @@ class Provisioner:
             "contract_pin": None,
             # Same legal entity: no supplier (RFC 0022 Phase 3, Art 25(4)).
             "supplier_legal_entity": None,
+            # RFC 0025 section 7a: the delegate outcomes the screening agent is
+            # built to handle (from its outcomes.json); any other answer is an
+            # unexpected_delegate_outcome finding on the demo system.
+            "expected_outcomes": expected_delegate_outcomes(SCREENING_DIST, FRAUD_DIST),
         }
         _, resp = self.cp.get(f"/v1/admin/ai-systems/{gid}/dependencies")
         edge = find(listing(resp, "dependencies"), depends_on_system_id=want["depends_on_system_id"])
@@ -1065,13 +1135,44 @@ class Provisioner:
                 raise StepError("composition", f"declare dependency: HTTP {status}: {_short(resp, 300)}")
             ok("composition.edge", f"{DEMO_SYSTEM_NAME} -> {FRAUD_SYSTEM_NAME} (shared service, critical) declared")
             return
+        def same(key: str, have: Any, wanted: Any) -> bool:
+            if key == "expected_outcomes" and isinstance(have, list):
+                return sorted(have) == wanted
+            return have == wanted
+
         delta = {k: v for k, v in want.items()
-                 if k not in ("role", "depends_on_system_id") and edge.get(k) != v}
+                 if k not in ("role", "depends_on_system_id") and not same(k, edge.get(k), v)}
         if delta:
             self.cp.patch(f"/v1/admin/ai-systems/{gid}/dependencies/{edge['id']}", delta, tolerate=(422,))
             ok("composition.edge", f"updated {sorted(delta)}")
         else:
             ok("composition.edge", f"{DEMO_SYSTEM_NAME} -> {FRAUD_SYSTEM_NAME} ({edge['id']})")
+
+    # -- 9c. declared outcomes (RFC 0025) --------------------------------------
+    def declared_outcomes(self) -> None:
+        """Declare each AI System's outcome catalogue from its agent's
+        outcomes.json (PUT /v1/admin/ai-systems/{id}/outcomes), only when the
+        stored document differs, so an unchanged re-run does not drift the
+        contract. The contract minted in step 14 captures it. No fallback: a
+        platform without the endpoint (404) cannot judge outcomes."""
+        section("9c. Declared outcomes")
+        for label, dist in (("fraud", FRAUD_DIST), ("demo", SCREENING_DIST)):
+            gid = self.ids[f"{label}_group_id"]
+            step = f"outcomes.{label}"
+            self.step(step)
+            want = outcome_catalogue(dist)
+            ids = sorted(f"{o['id']}.{v['id']}" if v else o["id"]
+                         for o in want for v in (o.get("variants") or [None]))
+            status, have = self.cp.get(f"/v1/admin/ai-systems/{gid}/outcomes", tolerate=(404,))
+            if status == 404:
+                raise StepError(step, "GET /outcomes -> 404: the platform predates RFC 0025 (a203); upgrade it")
+            if normalize_catalogue(_stored_catalogue(have)) == normalize_catalogue(want):
+                ok(step, f"{len(ids)} declared id(s) unchanged")
+                continue
+            _, resp = self.cp.put(f"/v1/admin/ai-systems/{gid}/outcomes", {"outcomes": want})
+            if normalize_catalogue(_stored_catalogue(resp)) != normalize_catalogue(want):
+                raise StepError(step, f"the control plane did not keep the catalogue: {_short(resp, 300)}")
+            ok(step, f"declared {', '.join(ids)}")
 
     # -- 9. identities and keys --------------------------------------------
     def identities_and_keys(self) -> None:
@@ -1770,6 +1871,7 @@ class Provisioner:
         self.agent_card()
         self.identities_and_keys()
         self.composition()
+        self.declared_outcomes()
         self.portal_underwriter()
         self.governance()
         self.assurance()
@@ -1840,6 +1942,22 @@ def _implementation_plan(dist: str) -> str:
             f"{want['approved_versions']}, require_release true")
 
 
+def _catalogue_plan(dist: str) -> str:
+    try:
+        cat = outcome_catalogue(dist)
+    except (OSError, ValueError) as exc:
+        return f"{dist} UNREADABLE ({exc})"
+    ids = [f"{o['id']}.{v['id']}" if v else o["id"] for o in cat for v in (o.get("variants") or [None])]
+    return f"{os.path.relpath(OUTCOME_FILES[dist], SYSTEM_ROOT)} [{', '.join(ids)}]"
+
+
+def _expected_plan() -> str:
+    try:
+        return str(expected_delegate_outcomes(SCREENING_DIST, FRAUD_DIST))
+    except (OSError, ValueError) as exc:
+        return f"UNREADABLE ({exc})"
+
+
 def dry_run(residency: bool, skip_lifecycle: bool, portal_user: bool = True) -> None:
     print(f"Brutor Demo System provisioning plan (dry run; nothing is called)")
     print(f"  control plane {CP_URL}   gateway {GW_URL}   tenant {TENANT_ID}   admin {ADMIN_USER}")
@@ -1879,7 +1997,11 @@ def dry_run(residency: bool, skip_lifecycle: bool, portal_user: bool = True) -> 
                             f"{FRAUD_SYSTEM_NAME} (shared_service via {FRAUD_CARD_NAME}, critical, "
                             "contributes to the decision, follows the active contract, same legal "
                             "entity: no supplier_legal_entity; the registry evaluates the screener "
-                            "at its effective tier, high)"),
+                            "at its effective tier, high); expected_outcomes "
+                            f"{_expected_plan()} (RFC 0025, from the screening agent's outcomes.json)"),
+        ("9c. declared_outcomes", "PUT /v1/admin/ai-systems/{fraud,demo}/outcomes {outcomes} from "
+                                  f"{_catalogue_plan(FRAUD_DIST)} and {_catalogue_plan(SCREENING_DIST)} "
+                                  "(only when the stored catalogue differs; 404 = platform predates RFC 0025)"),
         ("10. portal_user",
          "skipped (--no-portal-user)" if not portal_user else
          f"POST /v1/admin/end-users {PORTAL_UNDERWRITER_USER} ('{PORTAL_UNDERWRITER_DISPLAY}', "

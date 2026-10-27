@@ -126,7 +126,7 @@ def test_every_call_type_carries_the_release(settings, fake):
     gw.mcp_call("mcp-apps", "applications_get", {"application_id": "APP-20260923-001"}, step_id="gather")
     gw.skill_run("affordability-check", "affordability.py", {"requested_amount_eur": 1000}, step_id="gather")
     gw.a2a_delegate("agentcard-fraud", "screening.fraud_sanctions", {"full_name": "A", "bureau": {}}, step_id="assess")
-    assert gw.end_run("completed", "resolved") is True
+    assert gw.end_run("completed", "application_processed.loan_approved") is True
     gw.ctx = None
     gw.poll_approval("apr-1")
 

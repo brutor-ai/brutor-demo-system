@@ -6,14 +6,18 @@ On every tick resolve_pending() polls each entry:
 
     approved  -> new run bds-<application_id>-approval-<ulid>, one step
                  apply_approved_decision, the identical tool call with
-                 X-Approval-Token, Run-End completed / outcome resolved
+                 X-Approval-Token, Run-End completed / Outcome-Id
+                 application_processed.underwriter_decision_applied
     rejected  -> applications_hand_off in its own short run (Run-End
-                 completed / outcome handed_off): the application leaves the
-                 pending set as needs_manual_review; entry dropped
+                 completed / Outcome-Id application_processed.sent_to_manual_review):
+                 the application leaves the pending set as
+                 needs_manual_review; entry dropped (a hand-off that fails
+                 falls back to a note, Outcome-Id ...underwriter_hold_closed)
     expired   -> the hold is RE-RAISED: the identical tool call is re-issued
                  (no token) in run bds-<application_id>-rehold-<ulid>, step
-                 reraise_approval, closed Run-End completed / outcome
-                 escalated; the gateway answers 202 with a new approval id,
+                 reraise_approval, closed Run-End completed / Outcome-Id
+                 application_processed.underwriter_hold_renewed; the gateway
+                 answers 202 with a new approval id,
                  which replaces the old one. The application is never
                  re-screened while it is held, so the Tool Approvals queue
                  always holds the current decision until a human acts.
@@ -36,7 +40,8 @@ from typing import Any, Callable
 
 from .config import Settings
 from .failures import classify_failure
-from .gateway import ApprovalRequired, Gateway, GatewayError, PolicyBlocked, ToolError, new_ulid
+from .gateway import ApprovalRequired, Gateway, GatewayError, ToolError, new_ulid
+from .outcomes import SENT_TO_MANUAL_REVIEW, UNDERWRITER_DECISION_APPLIED, UNDERWRITER_HOLD_CLOSED, UNDERWRITER_HOLD_RENEWED
 
 log = logging.getLogger("screening_agent.approvals")
 
@@ -126,10 +131,10 @@ def note_run(
     suffix: str,
     step_id: str,
     step_name: str,
-    outcome: str = "handed_off",
+    outcome_id: str = UNDERWRITER_HOLD_CLOSED,
 ) -> str:
     """Add a note to an application inside its own short run that is closed
-    on the same call. Returns the run id."""
+    on the same call with `outcome_id`. Returns the run id."""
     run_id = f"bds-{application_id}-{suffix}-{new_ulid()}"
     with gw.run(run_id):
         gw.mcp_call(
@@ -139,9 +144,9 @@ def note_run(
             step_id=step_id,
             step_name=step_name,
             run_end="completed",
-            outcome=outcome,
+            outcome_id=outcome_id,
         )
-    log.info("run=%s state=completed outcome=%s application=%s note=%s", run_id, outcome, application_id, note[:80])
+    log.info("run=%s state=completed outcome=%s application=%s note=%s", run_id, outcome_id, application_id, note[:80])
     return run_id
 
 
@@ -158,8 +163,8 @@ def hand_off_run(
     """Hand an application off to manual underwriting: applications_hand_off
     moves it to the terminal status `needs_manual_review` (so it leaves the
     pending set) and records the reason as a note, in its own short run closed
-    on that call (outcome handed_off). Returns the run id; raises when the
-    application could not be handed off."""
+    on that call (Outcome-Id application_processed.sent_to_manual_review).
+    Returns the run id; raises when the application could not be handed off."""
     run_id = f"bds-{application_id}-{suffix}-{new_ulid()}"
     with gw.run(run_id):
         out = gw.mcp_call(
@@ -169,11 +174,11 @@ def hand_off_run(
             step_id=step_id,
             step_name=step_name,
             run_end="completed",
-            outcome="handed_off",
+            outcome_id=SENT_TO_MANUAL_REVIEW,
         )
     if isinstance(out, dict) and out.get("ok") is False and out.get("error") not in HAND_OFF_SETTLED_ERRORS:
         raise ToolError(f"{HAND_OFF_TOOL}: {out.get('error')}", body=out)
-    log.info("run=%s state=completed outcome=handed_off application=%s status=needs_manual_review", run_id, application_id)
+    log.info("run=%s state=completed outcome=%s application=%s status=needs_manual_review", run_id, SENT_TO_MANUAL_REVIEW, application_id)
     return run_id
 
 
@@ -191,16 +196,13 @@ def apply_approved(gw: Gateway, settings: Settings, entry: dict[str, Any], token
                 step_id="apply_approved_decision",
                 step_name="Apply underwriter-approved decision",
                 run_end="completed",
-                outcome="resolved",
+                outcome_id=UNDERWRITER_DECISION_APPLIED,
                 approval_token=token,
             )
-        except PolicyBlocked:
-            gw.end_run("blocked_policy", None)
-            raise
         except Exception:
-            gw.end_run("errored", None)
+            gw.end_run("errored")
             raise
-    log.info("run=%s state=completed outcome=resolved application=%s approval=%s", run_id, application_id, entry["approval_id"])
+    log.info("run=%s state=completed outcome=%s application=%s approval=%s", run_id, UNDERWRITER_DECISION_APPLIED, application_id, entry["approval_id"])
     return run_id
 
 
@@ -220,19 +222,17 @@ def reraise_hold(gw: Gateway, settings: Settings, entry: dict[str, Any]) -> str 
                 step_id="reraise_approval",
                 step_name="Re-raise underwriter approval",
                 run_end="completed",
-                outcome="escalated",
+                outcome_id=UNDERWRITER_HOLD_RENEWED,
             )
         except ApprovalRequired as held:
-            log.info("run=%s state=completed outcome=escalated application=%s approval=%s (re-raised from %s)", run_id, application_id, held.approval_id, entry.get("approval_id"))
+            log.info("run=%s state=completed outcome=%s application=%s approval=%s (re-raised from %s)", run_id, UNDERWRITER_HOLD_RENEWED, application_id, held.approval_id, entry.get("approval_id"))
             return held.approval_id
-        except PolicyBlocked:
-            gw.end_run("blocked_policy", None)
-            raise
         except Exception:
-            gw.end_run("errored", None)
+            gw.end_run("errored")
             raise
-    # No 202: the call was recorded outright. The run closed "escalated" on the
-    # header because we expected a hold; correct the ledger.
+    # No 202: the call was recorded outright. The run closed on the header as
+    # underwriter_hold_renewed because we expected a hold; an MCP-only run has
+    # no derived root, so the outcome cannot be corrected after the fact.
     log.warning("run=%s re-raise for application=%s was recorded without a hold; treating as applied", run_id, application_id)
     return None
 
@@ -374,7 +374,7 @@ def _safe_note(gw: Gateway, settings: Settings, application_id: str, note: str, 
             suffix=suffix,
             step_id="approval_closed",
             step_name="Approval hold closed",
-            outcome="handed_off",
+            outcome_id=UNDERWRITER_HOLD_CLOSED,
         )
     except Exception as exc:  # the note is best effort; the entry is dropped either way
         log.error("application=%s could not add note: %s", application_id, exc)
