@@ -17,24 +17,27 @@ the design.
 - Python 3.10 or later, for the set-up scripts.
 - An OpenAI API key. The demo uses `gpt-5.2` and `gpt-5.5` by default; one
   screening run makes three model calls.
-- Free ports: 3014, 3015, 9200 and 9201 for the demo, and 3002, 5050 and 8100
-  for Brutor Agent Control.
-- The Brutor Agent Control Community Edition package, from
-  https://trial.brutor.ai/ ("Download Brutor").
+- Free ports: 3014, 3015, 9200, 9201 and 9208 for the demo, and 3002, 5050 and
+  8100 for Brutor Agent Control.
+- Brutor Agent Control Community Edition with workload identity. Until the first
+  release that carries it, build it from source (below).
 
 ## 1. Start Brutor Agent Control
 
-In the unzipped package folder:
+From source:
 
 ```bash
-docker compose up -d
+git clone https://github.com/brutor-ai/brutor-agent-control.git
+cd brutor-agent-control/deploy/compose
+COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml ./start.sh
 docker compose ps
 ```
 
-The package's `.env` already holds its secrets and the administrator's
-password, generated for your download. There is nothing to edit and no license
-key. All seven services (`admin-console`, `control-plane`, `core`, `postgres`,
-`redis`, `skill-runner`, `witness`) must be `healthy`. The package's own
+`start.sh` fills the empty secrets in this folder's `.env`, the administrator's
+password included, then builds every image, starts the stack and waits until it
+is healthy. There is nothing else to edit and no license key. (From a release
+package that carries workload identity, the same is `./start.sh` in its folder.) All seven services (`admin-console`, `control-plane`, `core`, `postgres`,
+`redis`, `skill-runner`, `witness`) must be `healthy`. The folder's own
 `docs/getting-started-guide.md` covers the first start, sign-in and a first API
 key.
 
@@ -238,9 +241,11 @@ differs:
 
 ## Which Brutor Agent Control
 
-The demo needs the Community Edition package of the current release (or the
-Enterprise Edition trial package of the same release). `python verify.py`
-exiting 0 is how a stack is shown to run it.
+The demo needs a Community Edition (or Enterprise Edition) with workload
+identity: today a build from source of
+https://github.com/brutor-ai/brutor-agent-control (section 1), and from the first
+release that carries it, that release's package. `python verify.py` exiting 0 is
+how a stack is shown to run it.
 
 ## More
 

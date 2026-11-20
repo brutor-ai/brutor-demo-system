@@ -42,8 +42,10 @@ then provisions, then starts the screening agent.
 
 Prerequisites: **Brutor Agent Control Community Edition (or Enterprise)**
 running (Control Plane on :5050, Core Gateway on :8100, docker network
-`brutor-network`), Docker, Python 3.10+. Download: https://trial.brutor.ai/
-("Download Brutor"). First start: https://docs.brutor.ai/installation/quickstart/.
+`brutor-network`), Docker, Python 3.10+. It must have workload identity: until the
+first release that carries it, build it from source as the top-level
+[README](../README.md#quick-start) shows (`deploy/compose` of
+https://github.com/brutor-ai/brutor-agent-control, with `docker-compose.build.yml`).
 
 The administrator's password is not in this repository and has no default:
 Brutor Agent Control generates one per installation and keeps it in its own

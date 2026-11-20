@@ -190,14 +190,26 @@ run of its own.
 
 Prerequisites: **Brutor Agent Control Community Edition (or Enterprise)**
 running (Control Plane :5050, Core Gateway :8100, docker network
-`brutor-network`), Docker, Python 3.10+, an OpenAI key. Get Brutor Agent
-Control from https://trial.brutor.ai/ ("Download Brutor"; the Community Edition
-is one folder started with `docker compose up -d`) and see
-https://docs.brutor.ai/installation/quickstart/ for the first start.
+`brutor-network`), Docker with Compose v2, Python 3.10+, an OpenAI key.
 [docs/getting-started-guide.md](docs/getting-started-guide.md) walks through
-the whole path from a fresh download, with the output of a real run. Everything
-the demo does by default works on the Community Edition; the one Enterprise
-Edition variant is named where it appears.
+the whole path, with the output of a real run. Everything the demo does by
+default works on the Community Edition; the one Enterprise Edition variant is
+named where it appears.
+
+**Which Brutor Agent Control.** The demo's agents authenticate with workload
+identity (SPIRE), which needs a Brutor Agent Control build that has it. Until
+the first release that carries it, build the Community Edition from source:
+
+```bash
+git clone https://github.com/brutor-ai/brutor-agent-control.git
+cd brutor-agent-control/deploy/compose
+COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml ./start.sh
+```
+
+`start.sh` fills the empty secrets in that folder's `.env` (the administrator's
+password included), builds every Brutor image from source, starts the stack and
+waits until every service is healthy. Its `README.md` explains the rest. Once a
+release carries workload identity, its downloadable package works the same way.
 
 ```bash
 cd brutor-demo-system/brutor-demo-setup
@@ -210,9 +222,14 @@ python -m pip install -r requirements.txt
 
 **The gateway must be allowed to reach the demo.** Brutor Agent Control refuses
 outbound calls to private addresses (the docker network included) unless they are
-listed. In the `.env` of the Brutor folder, set
+listed. In the `.env` of the Brutor folder (`brutor-agent-control/deploy/compose/.env`
+for a source build), set
 `BRUTOR_OUTBOUND_ALLOW_HOSTS=witness,brutor-demo-applications-mcp,brutor-demo-credit-bureau-mcp,brutor-demo-fraud-screener-agent,brutor-demo-spire-oidc`
-and restart it (`docker compose up -d`) before `./demo.sh up`.
+and restart it before `./demo.sh up`: `docker compose up -d`, or for a source build
+`COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml docker compose up -d --wait`.
+
+**Free ports.** The demo publishes 3014, 3015, 9200, 9201 and 9208 (SPIRE's OIDC
+discovery) on 127.0.0.1; Brutor Agent Control uses 3002, 5050 and 8100.
 
 **The administrator's password.** Brutor Agent Control has no stock password:
 each installation has its own, in the `.env` of the Brutor folder, as
@@ -397,9 +414,11 @@ acceptance test. It is not part of the platform release scripts or of the
 Community or Enterprise packages: `./demo.sh up` builds its four images locally
 and provisions against the Brutor Agent Control stack that is running.
 
-**What it needs.** The Community Edition package of the current release of
-Brutor Agent Control. The Enterprise Edition trial package of the same release
-runs it too and adds the User Portal variant (`--portal-approver`).
+**What it needs.** A Brutor Agent Control Community Edition that has workload
+identity: today a build from source of https://github.com/brutor-ai/brutor-agent-control
+(see [Quick start](#quick-start)), and from the first release that carries it, that
+release's package. The Enterprise Edition of the same version runs it too and adds
+the User Portal variant (`--portal-approver`).
 
 **How it is verified.** Against a running stack, `python verify.py` (in
 `brutor-demo-setup`) reads back what setup declared and what the agents did,
