@@ -1,0 +1,541 @@
+"""A fake Core Gateway behind httpx.MockTransport.
+
+It records every request (method, path, headers, JSON body) so tests can
+assert the run/turn/step/close headers, and it answers the routes the agent
+uses with canned, configurable responses.
+
+The refusals below are the Core Gateway's own, shape and text:
+
+- a stopped run (`run_stopped_response`): HTTP 403 (an operator stopped it) or
+  429 (a run ceiling) with the canonical error body, on every tools/call of an
+  external server and of a system server (`skills__*`, `search__*`) alike,
+  before anything else is decided about the call;
+- an argument policy on a skill's input (`skill_policy_denied`,
+  `skill_policy_held`): judged inside the skill's execution, so the MCP
+  transport answers 200 and the verdict is the text of an `isError` tool
+  result, `skill_error_403: Argument policy (<policy>/<rule>): <message>` or
+  `skill_error_202: approval_required <envelope>`;
+- an argument policy on a tool (`argument_policy_denied_403`): HTTP 403 with a
+  JSON-RPC error -32000 whose `data.argument_policy` names the policy and the
+  rule; a hold is HTTP 202 with the approval envelope (`approval_envelope`).
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+import httpx
+
+from screening_agent.config import Settings
+from screening_agent.gateway import Gateway
+from screening_agent.identity import DISTRIBUTION, MCP_CLIENT_INFO_META_KEY
+from screening_agent.outcomes import OUTCOME_ID_RE, full_ids
+from screening_agent.prompts import DISCLOSURE
+
+SAMPLE_APPLICATION: dict[str, Any] = {
+    "application_id": "APP-20260923-001",
+    "received_at": "2026-09-23T08:00:00Z",
+    "applicant": {
+        "applicant_id": "CUST-1001",
+        "full_name": "Maja Lindholm",
+        "date_of_birth": "1987-04-12",
+        "country": "SE",
+        "email": "maja.lindholm@example.se",
+        "employment_status": "employed",
+    },
+    "requested_amount_eur": 12000,
+    "term_months": 48,
+    "purpose": "Kitchen renovation",
+    "monthly_income_eur": 4200,
+    "monthly_expenses_eur": 1900,
+    "existing_debt_monthly_eur": 250,
+    "status": "received",
+    "recommendation": None,
+    "notes": [],
+    "screened_at": None,
+}
+
+
+# The sentence an aborted run is refused with, and the one for a run that
+# reached its ceiling of model calls.
+RUN_ABORTED_MESSAGE = "This run was stopped by an operator. Start a new run to continue."
+RUN_CAP_MESSAGE = (
+    "This run has made {calls} model call(s), reaching its ceiling of {limit}. "
+    "The run was stopped here rather than allowed to consume the group's budget."
+)
+RUN_STOPS = ("aborted", "over_budget")
+# The refusal when the group's argument policies exist but cannot be applied.
+POLICY_UNAVAILABLE = {
+    "policy": "argument policy unavailable",
+    "rule": "policy_unavailable",
+    "message": "Refused: argument policies could not be loaded, so the call cannot be checked",
+}
+SKILL_POLICY_VERDICTS = ("deny", "hold")
+
+
+def run_stopped_response(kind: str) -> httpx.Response:
+    """A call of a run that may take no further step."""
+    if kind == "aborted":
+        return httpx.Response(403, json={"error": {"message": RUN_ABORTED_MESSAGE}})
+    if kind == "over_budget":
+        return httpx.Response(429, json={"error": {"message": RUN_CAP_MESSAGE.format(calls=6, limit=6)}})
+    raise ValueError(f"unknown run stop {kind!r}; expected one of {RUN_STOPS}")
+
+
+def approval_envelope(approval_id: str, capability_name: str, capability_type: str = "tool") -> dict[str, Any]:
+    """The body of a held call: which approval to wait for and where to poll."""
+    return {
+        "approval_required": True,
+        "approval_request_id": approval_id,
+        "capability_type": capability_type,
+        "capability_name": capability_name,
+        "server_name": "Agent Skills",
+        "surface": "mcp",
+        "timeout_seconds": 86400,
+        "expires_at": "2026-09-24T08:00:00+00:00",
+        "poll_url": f"/v1/approvals/{approval_id}/poll",
+        "message": f"{capability_type.capitalize()} '{capability_name}' requires approval. Submit with X-Approval-Token header after approval.",
+    }
+
+
+def _tool_error(text: str) -> httpx.Response:
+    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}], "isError": True}})
+
+
+def skill_policy_denied(
+    policy: str = "Affordability inputs are bounded",
+    rule: str = "field_gt",
+    message: str = "Loans over 50,000 EUR are not pre-screened.",
+) -> httpx.Response:
+    """skills__run_script when an argument policy on the skill's input denies."""
+    return _tool_error(f"skill_error_403: Argument policy ({policy}/{rule}): {message}")
+
+
+def skill_policy_held(approval_id: str, skill: str = "affordability-check") -> httpx.Response:
+    """skills__run_script when an argument policy on the skill's input holds the call."""
+    return _tool_error(f"skill_error_202: approval_required {json.dumps(approval_envelope(approval_id, skill, 'skill'))}")
+
+
+def argument_policy_denied_403(tool: str, policy: str, rule: str, message: str) -> dict[str, Any]:
+    """The body of a tool call an argument policy denies (HTTP 403)."""
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32000,
+            "message": message,
+            "data": {"argument_policy": {"policy": policy, "tool": tool, "argument": "*", "analyzer": "json", "rule": rule, "facts": {}}},
+        },
+    }
+
+
+@dataclass
+class Call:
+    method: str
+    path: str
+    headers: dict[str, str]
+    body: Any
+
+    @property
+    def run_id(self) -> str | None:
+        return self.headers.get("x-brutor-run-id")
+
+    @property
+    def outcome_id(self) -> str | None:
+        """X-Brutor-Outcome-Id on a proxied call, or outcome_id in an /end body."""
+        if isinstance(self.body, dict) and self.kind == "run_end":
+            return self.body.get("outcome_id")
+        return self.headers.get("x-brutor-outcome-id")
+
+    @property
+    def tool(self) -> str | None:
+        if isinstance(self.body, dict) and self.body.get("method") == "tools/call":
+            return self.body["params"]["name"]
+        return None
+
+    @property
+    def llm_api(self) -> str | None:
+        if self.path == "/v1/proxy/llm/chat/completions":
+            return "chat"
+        if self.path == "/v1/proxy/llm/responses":
+            return "responses"
+        return None
+
+    @property
+    def kind(self) -> str:
+        if "/v1/proxy/llm/" in self.path:
+            return "llm"
+        if "/v1/proxy/mcp/" in self.path:
+            return "mcp"
+        if "/v1/proxy/a2a/" in self.path:
+            return "a2a"
+        if "/v1/runs/" in self.path:
+            return "run_end"
+        if "/v1/approvals/" in self.path:
+            return "approval_poll"
+        return "other"
+
+
+def settings_for_tests(tmp_path) -> Settings:
+    return Settings(
+        gateway_url="http://gateway.test",
+        credential="api_key",
+        api_key="sk_brutor_api_FAKE_test_key_screening",
+        tenant_id="default",
+        applications_mcp_server_id="mcp-apps",
+        bureau_mcp_server_id="mcp-bureau",
+        skills_mcp_server_id="system-agent-skill-server-default",
+        fraud_card_id="agentcard-fraud",
+        data_dir=tmp_path,
+        tick_seconds=1,
+        max_per_tick=5,
+    )
+
+
+@dataclass
+class FakeGateway:
+    application: dict[str, Any] = field(default_factory=lambda: json.loads(json.dumps(SAMPLE_APPLICATION)))
+    identity_verified: bool = True
+    affordability_class: str = "comfortable"
+    risk_band: str = "low"
+    fraud_verdict: str = "clear"
+    drafter_recommendation: str = "approve"
+    drafter_includes_disclosure: bool = True
+    approval_rule: Callable[[dict[str, Any]], bool] | None = None  # args -> hold?
+    block_tool: str | None = None  # tool name that answers 403
+    fail_tool: str | None = None  # tool name that answers 500
+    fail_a2a: bool = False
+    # How the gateway returns the fraud screener's checked outcome:
+    # "header" (sync), "metadata" (final Task), "both", or "none".
+    fraud_outcome_carrier: str = "header"
+    # The outcome the gateway hands back; None = screening_completed.<fraud_verdict>.
+    fraud_outcome_id: str | None = None
+    fraud_conformance: str | None = "declared"
+    # Overrides for one carrier only (to make header and metadata disagree).
+    fraud_metadata_override: dict[str, Any] | None = None
+    approval_statuses: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_list: list[dict[str, Any]] | None = None
+    # More origination records besides `application` (see add_application).
+    applications: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Status overrides by application id (hand-off, recorded recommendation).
+    statuses: dict[str, str] = field(default_factory=dict)
+    # Hook run before every MCP tool: (tool, args, call) -> a canned response
+    # (any failure shape) or None to answer normally.
+    intercept: Callable[[str, dict[str, Any], "Call"], httpx.Response | None] | None = None
+    # run id -> "aborted" | "over_budget" | None: a run the gateway has stopped.
+    # Every tools/call of it is refused first, whatever the server.
+    run_stopped: Callable[[str], str | None] | None = None
+    # skills__run_script arguments -> "deny" | "hold" | None: what an argument
+    # policy on the skill's input says about them.
+    skill_policy: Callable[[dict[str, Any]], str | None] | None = None
+    # Canned answer for every LLM call (chat and responses), e.g. a 429.
+    llm_failure: Callable[[], httpx.Response] | None = None
+    # True = the gateway is gone (every request fails like a DNS lookup would).
+    down: bool = False
+    handed_off: list[dict[str, Any]] = field(default_factory=list)
+    derived_root: str = "root-derived-0001"
+    responses_only_models: set[str] = field(default_factory=set)  # chat answers 400 for these
+    calls: list[Call] = field(default_factory=list)
+    approval_counter: int = 0
+    recorded: list[dict[str, Any]] = field(default_factory=list)
+    notes: list[dict[str, Any]] = field(default_factory=list)
+    run_ends: list[dict[str, Any]] = field(default_factory=list)
+
+    # -- helpers ---------------------------------------------------------------
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handler)
+
+    def gateway(self, settings: Settings, credential=None) -> Gateway:
+        return Gateway(settings, http=httpx.Client(transport=self.transport()), credential=credential)
+
+    def runs(self) -> dict[str, list[Call]]:
+        out: dict[str, list[Call]] = {}
+        for c in self.calls:
+            if c.run_id:
+                out.setdefault(c.run_id, []).append(c)
+        return out
+
+    def calls_of(self, kind: str) -> list[Call]:
+        return [c for c in self.calls if c.kind == kind]
+
+    def add_application(self, application_id: str, received_at: str) -> dict[str, Any]:
+        record = json.loads(json.dumps(SAMPLE_APPLICATION))
+        record.update({"application_id": application_id, "received_at": received_at})
+        self.applications[application_id] = record
+        return record
+
+    def record(self, application_id: str | None) -> dict[str, Any] | None:
+        if application_id == self.application["application_id"]:
+            return self.application
+        return self.applications.get(str(application_id))
+
+    def status_of(self, application_id: str) -> str:
+        if application_id in self.statuses:
+            return self.statuses[application_id]
+        record = self.record(application_id)
+        return str(record.get("status") or "received") if record else "received"
+
+    def pending_ids(self) -> list[str]:
+        rows = self.pending_list
+        if rows is None:
+            records = [self.application, *self.applications.values()]
+            rows = sorted(records, key=lambda r: (r["received_at"], r["application_id"]))
+        return [str(r["application_id"]) for r in rows if self.status_of(str(r["application_id"])) == "received"]
+
+    # -- handler ---------------------------------------------------------------
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        raw = request.content
+        try:
+            body = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            body = raw.decode("utf-8", "replace")
+        call = Call(request.method, request.url.path, {k.lower(): v for k, v in request.headers.items()}, body)
+        self.calls.append(call)
+        if self.down:  # recorded (an attempt was made), never answered
+            raise httpx.ConnectError("[Errno -2] Name or service not known", request=request)
+        # A JWT-SVID (workload identity) or, in the development stage, an API key.
+        bearer = call.headers.get("authorization", "")
+        assert bearer.startswith(("Bearer sk_brutor_api_", "Bearer eyJ")), "missing Brutor bearer credential"
+        assert call.headers.get("x-brutor-run-end", "").lower() != "true", "X-Brutor-Run-End: true is banned"
+        # The agent names its implementation and release on every call.
+        assert call.headers.get("x-brutor-agent-name") == DISTRIBUTION, "missing X-Brutor-Agent-Name"
+        assert call.headers.get("x-brutor-agent-version"), "missing X-Brutor-Agent-Version"
+        # No X-Brutor-Run-Outcome header; the declared outcome rides
+        # only on the closing call and is one the agent's catalogue declares.
+        assert "x-brutor-run-outcome" not in call.headers, "X-Brutor-Run-Outcome is no longer a header of the platform"
+        if call.outcome_id is not None:
+            assert OUTCOME_ID_RE.fullmatch(call.outcome_id) and call.outcome_id in full_ids(), call.outcome_id
+            if call.kind != "run_end":
+                assert call.headers.get("x-brutor-run-end") in ("completed", "completed_degraded"), "outcome without a completed close"
+        path = request.url.path
+        if path == "/v1/proxy/llm/chat/completions":
+            return self._llm(body)
+        if path == "/v1/proxy/llm/responses":
+            return self._responses(body)
+        if path.startswith("/v1/proxy/mcp/"):
+            return self._mcp(path.rsplit("/", 1)[1], body, call)
+        if path == "/v1/proxy/a2a/outbound":
+            return self._a2a(body)
+        if path.startswith("/v1/runs/") and path.endswith("/end"):
+            assert set(body or {}) <= {"state", "outcome_id"}, body
+            self.run_ends.append({"root": path.split("/")[3], "body": body})
+            return httpx.Response(200, json={"ok": True})
+        if path.startswith("/v1/approvals/") and path.endswith("/poll"):
+            approval_id = path.split("/")[3]
+            status = self.approval_statuses.get(approval_id)
+            if status is None:
+                return httpx.Response(404, json={"error": "Approval request not found"})
+            return httpx.Response(200, json={"id": approval_id, **status})
+        return httpx.Response(404, json={"error": f"no route {path}"})
+
+    def _model_content(self, system: str) -> str:
+        if "risk classification step" in system:
+            content = json.dumps({"risk_band": self.risk_band, "key_factors": ["stable income", "moderate DTI"]})
+        else:
+            letter = "Dear Maja Lindholm, thank you for your application. Our pre-screening outcome and next step follow."
+            if self.drafter_includes_disclosure:
+                letter += " " + DISCLOSURE
+            content = json.dumps(
+                {
+                    "recommendation": self.drafter_recommendation,
+                    "rationale": "Income comfortably covers the installment.",
+                    "customer_letter": letter,
+                }
+            )
+        return content
+
+    def _llm(self, body: dict[str, Any]) -> httpx.Response:
+        assert "temperature" not in body and "top_p" not in body, "sampling params must not be sent"
+        if self.llm_failure:
+            return self.llm_failure()
+        assert body.get("response_format") == {"type": "json_object"}
+        if body["model"] in self.responses_only_models:
+            return httpx.Response(
+                400,
+                json={
+                    "error": "chat_completions_blocked",
+                    "message": f"Model '{body['model']}' only supports the Responses endpoint. POST to /v1/proxy/llm/responses with this model_name instead.",
+                },
+            )
+        content = self._model_content(body["messages"][0]["content"])
+        payload = {
+            "id": "chatcmpl-fake",
+            "object": "chat.completion",
+            "created": 1,
+            "model": body["model"],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        }
+        return httpx.Response(200, json=payload, headers={"x-brutor-run-id": self.derived_root})
+
+    def _responses(self, body: dict[str, Any]) -> httpx.Response:
+        """The Responses route as the gateway exposes it: model, input (string or
+        [{role, content}]), optional instructions/max_output_tokens/stream, other
+        fields passed through. Answers the OpenAI Responses object shape."""
+        assert "temperature" not in body and "top_p" not in body, "sampling params must not be sent"
+        assert "messages" not in body and "response_format" not in body, "chat fields on the responses route"
+        if self.llm_failure:
+            return self.llm_failure()
+        assert body.get("text") == {"format": {"type": "json_object"}}
+        items = body["input"]
+        assert isinstance(items, list) and items[0]["role"] == "system"
+        content = self._model_content(items[0]["content"])
+        payload = {
+            "id": "resp_fake",
+            "object": "response",
+            "created_at": 1,
+            "model": body["model"],
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_fake",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": content, "annotations": []}],
+                }
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        }
+        return httpx.Response(200, json=payload, headers={"x-brutor-run-id": self.derived_root})
+
+    @staticmethod
+    def _rpc(text: Any, *, is_error: bool = False, status: int = 200) -> httpx.Response:
+        if not isinstance(text, str):
+            text = json.dumps(text)
+        return httpx.Response(status, json={"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}], "isError": is_error}})
+
+    def _mcp(self, server: str, body: dict[str, Any], call: Call) -> httpx.Response:
+        client_info = (body["params"].get("_meta") or {}).get(MCP_CLIENT_INFO_META_KEY) or {}
+        assert client_info.get("name") == DISTRIBUTION and client_info.get("version"), "MCP call without clientInfo"
+        tool = body["params"]["name"]
+        args = body["params"].get("arguments") or {}
+        stop = self.run_stopped(call.run_id or "") if self.run_stopped else None
+        if stop:
+            return run_stopped_response(stop)
+        if self.intercept:
+            canned = self.intercept(tool, args, call)
+            if canned is not None:
+                return canned
+        if tool == self.block_tool:
+            return httpx.Response(403, json={"error": "guardrail_blocked", "guardrail": "prompt_injection", "surface": "mcp_output", "message": "Blocked by guardrail"})
+        if tool == self.fail_tool:
+            return httpx.Response(500, json={"error": "upstream failure"})
+        if tool == "applications_list_pending":
+            ids = self.pending_ids()
+            after = args.get("after")
+            if after:
+                ids = ids[ids.index(after) + 1:] if after in ids else ids
+            rows = []
+            for app_id in ids[: min(int(args.get("limit", 10)), 100)]:
+                record = self.record(app_id) or {}
+                rows.append({"application_id": app_id, "received_at": record.get("received_at", "2026-09-23T08:00:00Z"), "amount_eur": record.get("requested_amount_eur", 1000), "purpose_short": "Kitchen"})
+            return self._rpc(rows)
+        if tool == "applications_get":
+            record = self.record(args.get("application_id"))
+            if record is None:
+                return self._rpc(f"unknown application {args.get('application_id')}", is_error=True)
+            return self._rpc(record)
+        if tool == "applications_hand_off":
+            app_id = str(args.get("application_id"))
+            if self.status_of(app_id) == "screened":
+                return self._rpc({"ok": False, "error": "already_screened", "application_id": app_id})
+            self.statuses[app_id] = "needs_manual_review"
+            self.handed_off.append(args)
+            return self._rpc({"ok": True, "application_id": app_id, "status": "needs_manual_review"})
+        if tool == "applications_set_recommendation":
+            if self.approval_rule and self.approval_rule(args) and not call.headers.get("x-approval-token"):
+                self.approval_counter += 1
+                approval_id = f"apr-{self.approval_counter:04d}"
+                self.approval_statuses.setdefault(approval_id, {"status": "pending"})
+                return httpx.Response(
+                    202,
+                    json={
+                        "approval_required": True,
+                        "approval_request_id": approval_id,
+                        "capability_type": "tool",
+                        "capability_name": tool,
+                        "poll_url": f"/v1/approvals/{approval_id}/poll",
+                        "message": "Tool requires approval.",
+                    },
+                )
+            self.recorded.append({"args": args, "token": call.headers.get("x-approval-token")})
+            self.statuses[str(args.get("application_id"))] = "screened"
+            return self._rpc({"ok": True, "application_id": args.get("application_id"), "status": "screened"})
+        if tool == "applications_add_note":
+            self.notes.append(args)
+            return self._rpc({"ok": True, "notes_count": len(self.notes)})
+        if tool == "bureau_verify_identity":
+            return self._rpc({"verified": self.identity_verified, "match_score": 0.97 if self.identity_verified else 0.31, "checked_at": "2026-09-23T08:01:00Z"})
+        if tool == "bureau_get_report":
+            return self._rpc({"score": 712, "open_credit_lines": 2, "total_debt_eur": 5400, "delinquencies_24m": 0, "inquiries_6m": 1, "report_date": "2026-09-23", "bureau": "Borealis Demo Bureau"})
+        if tool == "skills__run_script":
+            assert server == "system-agent-skill-server-default"
+            assert args["skill_name"] == "affordability-check" and args["script"] == "affordability.py"
+            assert "requested_amount_eur" in args["args"]
+            verdict = self.skill_policy(args) if self.skill_policy else None
+            if verdict == "deny":
+                return skill_policy_denied()
+            if verdict == "hold":
+                self.approval_counter += 1
+                approval_id = f"apr-{self.approval_counter:04d}"
+                self.approval_statuses.setdefault(approval_id, {"status": "pending"})
+                return skill_policy_held(approval_id, args["skill_name"])
+            assert verdict is None, f"unknown skill policy verdict {verdict!r}; expected one of {SKILL_POLICY_VERDICTS}"
+            return self._rpc(
+                {
+                    "monthly_installment_eur": 301.2,
+                    "dti_before": 0.06,
+                    "dti_after": 0.13,
+                    "disposable_after_eur": 1748.8,
+                    "affordability_class": self.affordability_class,
+                    "flags": [],
+                    "policy_version": "2026-09",
+                }
+            )
+        return self._rpc(f"unknown tool {tool}", is_error=True)
+
+    def _a2a(self, body: dict[str, Any]) -> httpx.Response:
+        assert body["target_card_id"] == "agentcard-fraud"
+        assert body["capability"] == "screening.fraud_sanctions"
+        payload = json.loads(body["message"]["parts"][0]["text"])
+        assert "full_name" in payload and "bureau" in payload
+        if self.fail_a2a:
+            return httpx.Response(502, json={"error": "remote agent unreachable"})
+        outcome_id = self.fraud_outcome_id if self.fraud_outcome_id is not None else f"screening_completed.{self.fraud_verdict}"
+        checked = {"brutor.outcome.id": outcome_id, "brutor.outcome.conformance": self.fraud_conformance}
+        checked = {k: v for k, v in checked.items() if v is not None}
+        headers: dict[str, str] = {}
+        if self.fraud_outcome_carrier in ("header", "both"):
+            headers = {"x-brutor-outcome-id": outcome_id}
+            if self.fraud_conformance is not None:
+                headers["x-brutor-outcome-conformance"] = self.fraud_conformance
+        metadata: dict[str, Any] = {}
+        if self.fraud_outcome_carrier in ("metadata", "both"):
+            metadata = dict(checked)
+        if self.fraud_metadata_override:
+            metadata.update(self.fraud_metadata_override)
+        verdict = {
+            "verdict": self.fraud_verdict,
+            "sanctions_match": self.fraud_verdict == "hit",
+            "reasons": [] if self.fraud_verdict == "clear" else ["mock reason"],
+            "model_used": "gpt-5.2",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "task": {
+                    "id": str(uuid.uuid4()),
+                    "contextId": str(uuid.uuid4()),
+                    "status": {
+                        "state": "TASK_STATE_COMPLETED",
+                        "message": {"role": "ROLE_AGENT", "parts": [{"kind": "text", "text": json.dumps(verdict)}]},
+                    },
+                    **({"metadata": metadata} if metadata else {}),
+                }
+            },
+            headers=headers,
+        )

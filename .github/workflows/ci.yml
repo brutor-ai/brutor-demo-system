@@ -1,0 +1,198 @@
+# CI for the Brutor Demo System.
+#
+# Everything here runs without a Core Gateway or an OpenAI key: the unit
+# tests are in-process, the setup script has a --dry-run, and the images are
+# built but never pushed. The demo is a source-built add-on to a local Brutor Agent
+# Control Community Edition (see README "Release status"): nothing to publish.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # brutor-ai/brutor-agent-control, the commit the private-reference scanner is
+  # taken from. brutor-demo-setup/tests/private_references.py is the same file,
+  # held to the sha256 below by test_private_references.py.
+  BRUTOR_TOOLS_COMMIT: e0ca82a58e9d17eeaff1695fbe1b577cd0c35b98
+  GITLEAKS_VERSION: "8.30.1"
+  # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release's checksums file.
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets-guard:
+    timeout-minutes: 20
+    name: No secrets tracked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse committed env files and API keys
+        run: |
+          set -e
+          tracked=$(git ls-files | grep -E '(^|/)\.demo\.env$|(^|/)\.env$|(^|/)\.env\.[^/]*$' | grep -v '\.env\.example$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::Environment files must not be committed:"; echo "$tracked"; exit 1
+          fi
+          # OpenAI / Anthropic / Brutor key shapes in tracked files. Docs and the
+          # tests' deliberately fake fixture keys are excluded.
+          hits=$(git grep -nE 'sk-(proj-|ant-)?[A-Za-z0-9_-]{20,}|sk_brutor_api_[A-Za-z0-9]{16,}' -- ':!*.md' ':!**/tests/**' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Something that looks like a real API key is committed:"; echo "$hits"; exit 1
+          fi
+          echo "No env files or API keys tracked."
+
+  private-references:
+    timeout-minutes: 10
+    name: No private references
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Fetch the scanner (pinned, checksum verified)
+        run: |
+          mkdir -p /tmp/brutor-tools
+          base="https://raw.githubusercontent.com/brutor-ai/brutor-agent-control/${BRUTOR_TOOLS_COMMIT}"
+          curl -fsSL -o /tmp/brutor-tools/private_references.py "$base/control-plane/tests/private_references.py"
+          cd /tmp/brutor-tools
+          printf '%s  %s\n' \
+            23c1d253695a284b1356b1cc9d9c3c2b94ecea8de3a72f3c6ac82d959de6cc0e private_references.py \
+            | sha256sum -c -
+      - name: No reference to a record outside this repository
+        run: >-
+          python3 /tmp/brutor-tools/private_references.py .
+          --declared scripts/private_references.json
+          --left-out brutor-demo-setup/tests/private_references.py
+
+  secret-scan:
+    timeout-minutes: 15
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The pinned release, checked against its published sha256 before it runs.
+      - name: Install gitleaks
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks version
+      # The tree (with .gitleaks.toml), then the commits a pull request or a
+      # push adds. Earlier history is not rescanned on every run.
+      - name: Scan for secrets
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          /tmp/gitleaks dir --redact --no-banner --exit-code 1 .
+          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            /tmp/gitleaks git --redact --no-banner --exit-code 1 --log-opts="$BASE..$HEAD" .
+          fi
+
+  tests:
+    timeout-minutes: 20
+    name: Tests · ${{ matrix.component }} · py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        component:
+          - brutor-demo-applications-mcp
+          - brutor-demo-credit-bureau-mcp
+          - brutor-demo-fraud-screener-agent
+          - brutor-demo-screening-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: ${{ matrix.component }}/pyproject.toml
+      - name: Install
+        run: python -m pip install "./${{ matrix.component }}[test]"
+      - name: Test
+        working-directory: ${{ matrix.component }}
+        run: python -m pytest -q
+
+  skill:
+    timeout-minutes: 20
+    name: Tests · affordability skill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - name: Test
+        working-directory: brutor-demo-affordability-skill
+        run: python -m pytest -q
+
+  setup:
+    timeout-minutes: 20
+    name: Setup scripts and compose
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: brutor-demo-setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python compiles
+        run: python -m py_compile setup.py verify.py approve.py copied_key.py
+      - name: Provisioning plan (dry run, no gateway needed)
+        run: python setup.py --dry-run
+      - name: Provisioning and read-back tests (fake Control Plane)
+        run: |
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q tests
+      - name: Shell scripts
+        run: |
+          bash -n demo.sh
+          shellcheck -S error demo.sh ../*/smoke.sh
+      - name: Compose file resolves
+        run: |
+          cp .env.example .env
+          touch .demo.env
+          docker compose -f docker-compose.yml --profile agent config --quiet
+          docker compose -f docker-compose.yml -f spire/docker-compose.unix-attestor.yml --profile agent config --quiet
+
+  images:
+    timeout-minutes: 20
+    name: Image · ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - brutor-demo-applications-mcp
+          - brutor-demo-credit-bureau-mcp
+          - brutor-demo-fraud-screener-agent
+          - brutor-demo-screening-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.component }}
+          push: false
+          tags: ${{ matrix.component }}:ci
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}

@@ -1,0 +1,10 @@
+# The fallback when the SPIRE Agent may not have the Docker socket: laid over
+# ../docker-compose.yml by demo.sh when SPIRE_WORKLOAD_ATTESTOR=unix. The agent
+# attests callers by their user id (agent-unix.conf) instead of their container.
+services:
+  spire-agent:
+    volumes: !override
+      - ./spire/agent-unix.conf:/opt/spire/conf/agent/agent.conf:ro
+      - ./spire/runtime:/run/spire/bundle:ro
+      - brutor-demo-spire-agent-data:/var/lib/spire/agent
+      - brutor-demo-spire-agent-socket:/tmp/spire-agent/public

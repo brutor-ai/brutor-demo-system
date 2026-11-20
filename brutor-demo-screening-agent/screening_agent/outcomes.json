@@ -1,0 +1,88 @@
+{
+  "outcomes": [
+    {
+      "id": "application_processed",
+      "label": "Application processed",
+      "description": "The agent did its job on one loan application: recorded a recommendation, held it for an underwriter, applied the underwriter's decision or handed the application to manual review.",
+      "counts_toward_baseline": true,
+      "variants": [
+        {
+          "id": "loan_approved",
+          "label": "Recommended: approve",
+          "expect": {"requires_capabilities": ["applications_set_recommendation"]}
+        },
+        {
+          "id": "loan_rejected",
+          "label": "Recommended: decline",
+          "expect": {"requires_capabilities": ["applications_set_recommendation"]}
+        },
+        {
+          "id": "loan_referred",
+          "label": "Recommended: refer",
+          "expect": {"requires_capabilities": ["applications_set_recommendation"]}
+        },
+        {
+          "id": "held_for_underwriter",
+          "label": "Held for underwriter approval",
+          "description": "The recommendation was held by the gateway for a human; the hold was noted on the application.",
+          "expect": {"requires_capabilities": ["applications_add_note"]}
+        },
+        {
+          "id": "underwriter_decision_applied",
+          "label": "Underwriter-approved decision applied",
+          "expect": {"max_actions": 2, "max_model_calls": 0}
+        },
+        {
+          "id": "underwriter_hold_renewed",
+          "label": "Lapsed underwriter hold re-raised",
+          "description": "The underwriter never decided and the hold lapsed; the identical call was re-issued so the decision stays held.",
+          "expect": {"max_actions": 2, "max_model_calls": 0, "requires_capabilities": ["applications_set_recommendation"]}
+        },
+        {
+          "id": "underwriter_hold_closed",
+          "label": "Underwriter hold closed with a note",
+          "description": "The hold ended but the decision could not be applied or the application could not be handed off; a note says so.",
+          "expect": {"max_model_calls": 0, "requires_capabilities": ["applications_add_note"]}
+        },
+        {
+          "id": "sent_to_manual_review",
+          "label": "Sent to manual review",
+          "expect": {"max_model_calls": 0, "requires_capabilities": ["applications_hand_off"]}
+        }
+      ]
+    },
+    {
+      "id": "no_applications_available",
+      "label": "Nothing to screen",
+      "description": "A scheduler tick that found no application to screen.",
+      "counts_toward_baseline": false,
+      "expect": {
+        "max_model_calls": 0,
+        "max_cost_usd": 0,
+        "forbids_capabilities": ["applications_set_recommendation", "applications_add_note", "applications_hand_off"]
+      }
+    },
+    {
+      "id": "applications_dispatched",
+      "label": "Applications handed to screening runs",
+      "description": "A scheduler tick that found applications to screen and handed each to a run of its own; the work is counted in those runs.",
+      "counts_toward_baseline": false,
+      "expect": {
+        "max_model_calls": 0,
+        "max_cost_usd": 0,
+        "forbids_capabilities": ["applications_set_recommendation", "applications_add_note", "applications_hand_off"]
+      }
+    }
+  ],
+  "dependencies": [
+    {
+      "delegate": "brutor-demo-fraud-screener-agent",
+      "capability": "screening.fraud_sanctions",
+      "expected_outcomes": [
+        "screening_completed.clear",
+        "screening_completed.review",
+        "screening_completed.hit"
+      ]
+    }
+  ]
+}

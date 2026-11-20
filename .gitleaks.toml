@@ -1,0 +1,21 @@
+# gitleaks configuration of the Brutor Demo System: gitleaks' default rules,
+# plus an allow-list in which every entry says why it is not a secret. Add an
+# entry only for a value a person has read and found to be a test value; name
+# the file, and the value by a fragment, never a whole file type.
+
+title = "Brutor Demo System"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The agents' tests give their settings a key in the shape of a Brutor API key (sk_brutor_api_ and a fake marker) so that the code path for an API key runs; the fake gateway the tests talk to accepts any value, and no gateway has issued it."
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''^brutor-demo-screening-agent/tests/test_identity\.py$''',
+  '''^brutor-demo-screening-agent/tests/fake_gateway\.py$''',
+  '''^brutor-demo-fraud-screener-agent/tests/test_identity\.py$''',
+  '''^brutor-demo-fraud-screener-agent/tests/conftest\.py$''',
+]
+regexes = ['''^sk_brutor_api_(?:FAKE_test_key_|testkey0123456789$|fraudkey0123456789$)''']
