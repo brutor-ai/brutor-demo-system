@@ -1,0 +1,16 @@
+# Dependabot keeps the actions the workflows run current. Every action is
+# pinned to a commit with its release in a comment
+# (`uses: owner/action@<sha> # v1.2.3`); Dependabot reads the comment,
+# proposes the next release's commit and rewrites both. The pull request
+# runs every check like any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
